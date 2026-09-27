@@ -22,7 +22,7 @@ xpzouying/xiaohongshu-mcp（Go/go-rod，成熟稳定）。确定性 IO 固化在
   publish-video  视频发布（--video）
   selftest       离线自检（选择器字典 / 参数解析 / 标题长度算法）
 
-真实发布需：playwright + chromium 内核 + 已扫码登录 + 外网可达（默认走项目代理）。
+真实发布需：playwright + chromium 内核 + 已扫码登录 + 网络可达（默认直连，显式 --proxy 才走代理）。
 """
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
@@ -129,13 +130,30 @@ def _profile_dir(base: str | None) -> Path:
 
 
 def _proxy(explicit: str | None, disable: bool) -> str | None:
-    """外网代理：--no-proxy 关；--proxy 显式；否则取 env（小红书是外网，默认需代理）。"""
-    if disable:
-        return None
-    if explicit:
-        return explicit
-    return os.environ.get("https_proxy") or os.environ.get("http_proxy") \
-        or os.environ.get("EASEL_PROXY")
+    """小红书默认直连，不继承用于境外服务的环境代理。"""
+    return None if disable else explicit
+
+
+def _login_error(page) -> str | None:
+    """仅根据实际页面识别限制，不把所有错误页都归因为 IP。"""
+    try:
+        url = urlsplit(page.url)
+        title = page.title() or ""
+        if "website-login/error" not in url.path and "安全限制" not in title:
+            return None
+        body = page.locator("body").inner_text(timeout=2000)
+        query = parse_qs(url.query)
+        # 不记录完整 URL、查询参数或页面正文，避免泄漏会话信息。
+        codes = [v for k in ("code", "errorCode", "error_code")
+                 for v in query.get(k, []) if re.fullmatch(r"\d{3,8}", v)]
+        if not codes:
+            codes = re.findall(r"(?<!\d)3000\d{2}(?!\d)", body)
+        suffix = f"（页面错误码 {codes[0]}）" if codes else ""
+        if re.search(r"IP\s*存在风险", body, re.I):
+            return "小红书页面明确提示 IP 存在风险" + suffix
+        return "小红书返回登录安全限制，尚不能确定是 IP 原因" + suffix
+    except Exception:
+        return None  # 导航竞态时下次轮询再检查
 
 
 # --------------------------------------------------------------------------- #
@@ -428,7 +446,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     else:
-        # 显式直连：Chromium 级屏蔽系统/环境代理（开 VPN 也能用）——同抖音链兜底
+        # 显式直连：屏蔽系统/环境 HTTP 代理；无法绕过操作系统级 VPN/TUN
         args.append("--no-proxy-server")
     return p.chromium.launch_persistent_context(str(profile), **kwargs)
 
@@ -500,23 +518,25 @@ def cmd_login(a) -> int:
         try:
             page.goto(EXPLORE_URL, wait_until="domcontentloaded")
 
-            def _risk_blocked() -> bool:
-                """小红书风险 IP 拦截页（重定向可能晚于 domcontentloaded，须重复查）。"""
+            def _check_login_error():
+                message = _login_error(page)
+                if not message:
+                    return
+                route = "显式代理" if _proxy(a.proxy, a.no_proxy) else "直连（已禁用浏览器代理）"
+                message += f"；当前连接：{route}。"
+                login_state.write_status(sf, "error", message)
+                # 仅限制页截图用于本机诊断，不导出 cookie 或完整 URL。
                 try:
-                    return ("website-login/error" in page.url
-                            or "安全限制" in (page.title() or ""))
+                    qr_out.parent.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(qr_out.with_name(qr_out.stem + "-error.png")))
                 except Exception:
-                    return False
+                    pass
+                _die(message, 4)
 
             # 等待页面稳定并完成可能的跳转（登录引导 / 风险拦截 / 已登录态）
             for _ in range(10):
                 page.wait_for_timeout(800)
-                if _risk_blocked():
-                    login_state.write_status(sf, "error", "IP 存在风险，需干净网络/代理")
-                    _die("小红书判定当前网络为风险 IP（安全限制 300012「IP存在风险，请切换可靠网络环境」）——"
-                         "二维码在此环境无法弹出。解决：①用干净/家宽 IP 的代理 `--proxy socks5://...`；"
-                         "②在正常网络的机器上 login 拿到登录态，再把持久化目录 "
-                         f"{_profile_dir(a.profile_base)} 整个拷到本机复用。", 4)
+                _check_login_error()
                 try:
                     if page.query_selector(SELECTORS["login_ok"]) is not None:
                         break  # 已登录
@@ -538,12 +558,7 @@ def cmd_login(a) -> int:
                 qr = _wait_sel(page, SELECTORS["qrcode"], 20000, "登录二维码")
             except Exception:
                 # 超时后先复查是不是风险拦截页（重定向晚到的情况），别误报「页面结构变了」
-                if _risk_blocked():
-                    login_state.write_status(sf, "error", "IP 存在风险，需干净网络/代理")
-                    _die("小红书判定当前网络为风险 IP（安全限制 300012「IP存在风险，请切换可靠网络环境」）——"
-                         "二维码在此环境无法弹出。解决：①用干净/家宽 IP 的代理 `--proxy socks5://...`；"
-                         "②在正常网络的机器上 login 拿到登录态，再把持久化目录 "
-                         f"{_profile_dir(a.profile_base)} 整个拷到本机复用。", 4)
+                _check_login_error()
                 login_state.write_status(sf, "error", "未找到登录二维码")
                 _die("未找到登录二维码（页面结构可能已变，检查 SELECTORS.qrcode），"
                      "或已弹别的登录方式——可加 --headed 观察")
@@ -786,7 +801,7 @@ def main() -> int:
 
     def add_common(p):
         p.add_argument("--profile-base", help="登录态根目录（默认 ~/.easel-browser-profiles）")
-        p.add_argument("--proxy", help="外网代理（默认取 env，小红书是外网需代理）")
+        p.add_argument("--proxy", help="显式代理地址（默认直连，不读取环境代理）")
         p.add_argument("--no-proxy", action="store_true", help="禁用代理")
 
     def add_content(p):

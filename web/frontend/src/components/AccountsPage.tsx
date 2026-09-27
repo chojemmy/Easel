@@ -283,7 +283,7 @@ export default function AccountsPage() {
           <h1 className="page-title">账号登录 Accounts</h1>
           <p className="page-subtitle">
             用手机 App 扫码登录，登录态本地持久化，之后发布免登。<br />
-            ⚠️ 平台可能对机房/代理 IP 判风险导致二维码弹不出，需干净/家宽 IP，或在正常网络登录后拷贝登录态目录。
+            小红书默认直连；Windows 本地登录会打开浏览器窗口，请扫码并完成平台验证。这里的登录态独立于日常使用的 Edge。
           </p>
         </div>
         <button className="btn btn-sm" onClick={load}>⟳ 刷新</button>
@@ -386,7 +386,7 @@ export default function AccountsPage() {
               <div style={{ fontSize: 48, padding: 40 }}>✅</div>
             ) : ['error', 'expired'].includes(qr.state) ? (
               <div style={{ fontSize: 13, color: 'var(--red)', padding: 30 }}>
-                {qr.message || '登录失败'}<br />可关闭后重试（或换干净 IP）。
+                {qr.message || '登录失败'}<br />请先查看具体错误及浏览器窗口提示；不要连续重试或仅凭此提示更换网络。
               </div>
             ) : (
               <div className="loading" style={{ padding: 40 }}><div className="spinner" />准备二维码…</div>

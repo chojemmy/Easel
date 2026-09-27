@@ -2947,6 +2947,10 @@ async def api_login_start(platform: str):
     if backend == 'xhs':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'login', '--no-proxy',
                '--qr-out', str(qr), '--status-file', str(status), '--timeout', str(LOGIN_TIMEOUT)]
+        # Windows 本地扫码使用可见窗口，便于用户完成平台验证。
+        # Linux/无桌面部署仍保留二维码图片方式，可通过环境变量显式选择。
+        if os.environ.get('EASEL_XHS_HEADED', '1' if sys.platform == 'win32' else '0') == '1':
+            cmd.append('--headed')
     elif backend == 'biliup':
         # B站：TV 端扫码登录 API 生成二维码 + 写 biliup cookie（biliup login 需真终端，前端用不了）
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'login',
