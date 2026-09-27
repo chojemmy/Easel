@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import EnvBoard from './EnvBoard';
+import MiniMaxPanel from './MiniMaxPanel';
 import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
@@ -11,7 +12,7 @@ import { IconSlidersHorizontal, IconPackage, IconEllipsis } from './settingsIcon
 
 interface Props { onClose: () => void; }
 
-type Sec = 'model' | 'env' | 'more';
+type Sec = 'model' | 'env' | 'more' | 'minimax';
 type Chan = 'chat' | 'transcribe' | 'speech' | 'image' | 'video' | 'music';
 
 const CHANNELS: { id: Chan; label: string }[] = [
@@ -458,12 +459,16 @@ export default function SettingsPanel({ onClose }: Props) {
             <button className={`snav${sec === 'env' ? ' active' : ''}`} onClick={() => setSec('env')}>
               <IconPackage size={16} />环境安装<small>{total ? (okCount === total ? '全就绪' : `${okCount}/${total}`) : '…'}</small>
             </button>
+            <button className={`snav${sec === 'minimax' ? ' active' : ''}`} onClick={() => setSec('minimax')}>
+              <IconSlidersHorizontal size={16} />MiniMax 额度<small>自动创作</small>
+            </button>
             <button className={`snav${sec === 'more' ? ' active' : ''}`} onClick={() => setSec('more')}>
               <IconEllipsis size={16} />更多设置
             </button>
           </nav>
 
           <div className="settings-main">
+            {sec === 'minimax' && <MiniMaxPanel />}
             {sec === 'model' && (
               <section className="st-sec active">
                 <div className="tabbar">

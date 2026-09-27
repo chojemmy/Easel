@@ -1,0 +1,23 @@
+.minimax-panel { font-size: 14px; line-height: 1.6; }
+.minimax-panel h2 { margin: 0 0 8px; font-size: 22px; }
+.minimax-panel h3 { margin: 10px 0 0; font-size: 17px; }
+.minimax-panel p { margin: 8px 0 12px; }
+.minimax-panel small { color: #737782; }
+.minimax-panel label { display: inline-flex; align-items: center; gap: 6px; }
+.minimax-panel input, .minimax-panel textarea, .minimax-panel select,
+.minimax-panel button { font: inherit; }
+.minimax-panel input[type=number], .minimax-panel select, .minimax-panel textarea {
+  border: 1px solid #dce0e6; border-radius: 8px; padding: 7px 9px; background: #fff; color: #242936;
+}
+.minimax-panel textarea { width: 100%; min-height: 85px; resize: vertical; box-sizing: border-box; }
+.minimax-panel input[type=checkbox], .minimax-panel progress { accent-color: #7389b7; }
+.minimax-panel button {
+  width: fit-content; border: 1px solid #d4dce9; border-radius: 8px; padding: 7px 16px;
+  background: #edf2fa; color: #405887; cursor: pointer;
+}
+.minimax-panel button:hover:not(:disabled) { background: #e0e8f5; }
+.minimax-panel button:disabled { opacity: .45; cursor: default; }
+.minimax-panel input:focus-visible, .minimax-panel textarea:focus-visible,
+.minimax-panel select:focus-visible, .minimax-panel button:focus-visible {
+  outline: 2px solid #92a6cc; outline-offset: 2px;
+}

@@ -145,7 +145,7 @@ MODEL_GROUPS: dict[str, dict[str, Any]] = {
             {
                 "id": "minimax", "name": "MiniMax", "keys": [
                     _key("MINIMAX_API_KEY", "API Key"),
-                    _key("MINIMAX_GROUP_ID", "Group ID", secret=False),
+                    _key("MINIMAX_GROUP_ID", "Group ID（旧版接口可选）", required=False, secret=False),
                     _key("MINIMAX_MODEL", "TTS 模型", required=False, secret=False),
                     _key("MINIMAX_BASE_URL", "根地址", required=False, secret=False),
                 ],
@@ -230,6 +230,11 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
                 value = value[1:-1]
             values[key.strip()] = value
     values.update({key: value for key, value in os.environ.items() if value})
+    # A secret reference is usable only when the launcher supplied its value.
+    for key, value in list(values.items()):
+        ref = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
+        if ref:
+            values[key] = os.environ.get(ref.group(1), "")
     return values
 
 

@@ -257,10 +257,10 @@ def _save_bytes(b: bytes, out: Path) -> Path:
 # ── enroll（登记音色） ──────────────────────────────────────
 def enroll_minimax(a) -> str:
     key = require_env("MINIMAX_API_KEY")
-    group = require_env("MINIMAX_GROUP_ID")
+    group = os.environ.get("MINIMAX_GROUP_ID", "").strip()
     base = (os.environ.get("MINIMAX_BASE_URL", "").strip() or "https://api.minimax.chat").rstrip("/")
     # 1) 上传文件
-    up = http_multipart(f"{base}/v1/files/upload?GroupId={group}",
+    up = http_multipart(f"{base}/v1/files/upload" + (f"?GroupId={group}" if group else ""),
                         {"Authorization": f"Bearer {key}"},
                         {"purpose": "voice_clone"}, "file", Path(a.sample))
     file_id = str(((up.get("file") or {}).get("file_id")) or up.get("file_id") or "")
@@ -268,7 +268,7 @@ def enroll_minimax(a) -> str:
         fail(f"上传未返回 file_id：{json.dumps(up, ensure_ascii=False)[:300]}")
     voice_id = a.name or f"easel_{uuid.uuid4().hex[:10]}"
     # 2) 克隆
-    http_json(f"{base}/v1/voice_clone?GroupId={group}",
+    http_json(f"{base}/v1/voice_clone" + (f"?GroupId={group}" if group else ""),
               {"Authorization": f"Bearer {key}"},
               {"file_id": file_id, "voice_id": voice_id})
     return voice_id
@@ -314,7 +314,7 @@ def cmd_enroll(a) -> int:
 # ── clone（合成） ───────────────────────────────────────────
 def clone_minimax(a, out: Path) -> Path:
     key = require_env("MINIMAX_API_KEY")
-    group = require_env("MINIMAX_GROUP_ID")
+    group = os.environ.get("MINIMAX_GROUP_ID", "").strip()
     base = (os.environ.get("MINIMAX_BASE_URL", "").strip() or "https://api.minimax.chat").rstrip("/")
     model = a.model or os.environ.get("MINIMAX_MODEL", "").strip() or "speech-01"
     if not a.voice_id:
@@ -323,7 +323,7 @@ def clone_minimax(a, out: Path) -> Path:
     emo = minimax_emotion(getattr(a, "emotion", None))
     if emo != "neutral":
         voice_setting["emotion"] = emo   # speech-02 等支持；旧模型会忽略未知字段
-    resp = http_json(f"{base}/v1/t2a_v2?GroupId={group}",
+    resp = http_json(f"{base}/v1/t2a_v2" + (f"?GroupId={group}" if group else ""),
                      {"Authorization": f"Bearer {key}"},
                      {"model": model, "text": a.text,
                       "voice_setting": voice_setting,

@@ -35,6 +35,11 @@
 
 ![Easel 产品宣传海报](assets/readme/poster.png)
 
+## 本 fork 的扩展
+
+新增 MiniMax 生图、视频、语音接入，以及 **设置 → MiniMax 额度**：查看 Token Plan 剩余额度、重置倒计时；预存创作任务，按额度条件自动调用 OpenClaw。
+检查间隔默认 15 分钟，可自行调整；自动运行默认关闭。详见 [MiniMax 配置与使用](docs/MINIMAX.md)。
+
 ## 🎨 Easel 是什么
 
 Easel 是一个面向社交媒体创作者的开源内容工作台。它把 OpenClaw Agent、账号画像、内容技能和真实的媒体工具接在一起，让 Agent 不只回答“应该怎么做”，而是直接把内容做出来并归档，且可实现直接/按需发布。

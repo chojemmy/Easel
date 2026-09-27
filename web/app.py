@@ -417,11 +417,18 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
-    yield
-    _stop_mp_login_on_shutdown()
+    minimax_service.worker = asyncio.create_task(minimax_service.loop())
+    try:
+        yield
+    finally:
+        await minimax_service.stop()
+        _stop_mp_login_on_shutdown()
 
 
 app = FastAPI(title="Easel", docs_url=None, redoc_url=None, lifespan=_lifespan)
+from easel.minimax_quota import QuotaService, router as minimax_router
+minimax_service = QuotaService(PROJECT_ROOT)
+app.include_router(minimax_router(minimax_service))
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -592,7 +599,11 @@ def _read_env() -> dict[str, str]:
         key, val = s.split('=', 1)
         key = key.strip()
         if key.isidentifier() or key.replace('-', '_').isidentifier():
-            result[key] = val.strip()
+            value = val.strip()
+            # Resolve secret references from the DPAPI launcher's environment.
+            # An unresolved reference is not a configured credential.
+            ref = re.fullmatch(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', value)
+            result[key] = os.environ.get(ref.group(1), '') if ref else value
     return result
 
 
