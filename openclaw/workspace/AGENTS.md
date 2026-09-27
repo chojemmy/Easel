@@ -108,3 +108,14 @@ python skills/openclaw/skill-publish-log/scripts/log.py record --platform <平�
 - 聚焦社媒内容创作，不做无关通用聊天或平台违规操作。
 - 有把握就做，没把握就问；不每次都出 Plan，也不在关键输入缺失时强行执行。
 - 制作任务必须读 SKILL、明确要点并自检；自检宽容但诚实，不为返工而返工。
+
+## 网络、浏览器与本机视频环境
+
+- 境外网站（例如 linux.do、GitHub、Google、Hugging Face、Remotion）默认使用 HTTP 代理 `http://127.0.0.1:7890`；若设置了 `EASEL_PROXY`，以该值为准。不是 SOCKS 端口。
+- CLI / Python 请求使用 `HTTP_PROXY`、`HTTPS_PROXY`（或显式 proxy 参数）；Node 设置 `NODE_USE_ENV_PROXY=1`。不要清空代理后反复直连境外站点。
+- localhost、127.0.0.1 和国内平台（小红书、抖音、快手、微信、B站等）直连；小红书发布脚本保留 `--no-proxy`，避免代理出口风控。
+- Playwright/Chromium 不保证继承 HTTP_PROXY；启动自己管理的浏览器时显式传 proxy。已有 Edge 会话沿用该浏览器的网络设置，不擅自修改用户浏览器配置。
+- 连接失败要区分：连接/超时、HTTP 拒绝、Cloudflare 人机验证。代理返回验证页说明路由已通，应报告需用户完成验证，不把它当成没配代理，也不要绕过验证。
+- 复用本机 Edge 登录态时使用 OpenClaw 的 `edge` existing-session profile（配置后可用），而非默认 Chrome `user` profile。用户需在 `edge://inspect/#remote-debugging` 启用并允许连接。未授权时请说明，不要求重新安装 Chrome。
+- Easel 自己的发布浏览器登录态与日常 Edge 是两个独立目录；通过 Edge 操作不代表 Easel 的扫码登录检查已登录。不要把 Cookie、密钥、登录态写入对话、Git 或知识库。
+- Remotion 工程位于项目根 `skills/openclaw/video-production/vendor/video-pipeline-sdk/deps/remotion`，先在该目录用本地 `node_modules/@remotion/cli/remotion-cli.js` 检查/渲染，不因项目根没有 remotion 包就重复全局安装。各 Remotion 包版本必须一致。

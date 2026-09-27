@@ -1080,6 +1080,7 @@ async def api_env_save(req: EnvUpdateRequest):
 # ═══════════════════════════════════════════════════════════════════════
 
 INSTALL_TOOL = SHARED_SCRIPTS / "install_tool.py"
+REMOTION_DIR = PROJECT_ROOT / "skills/openclaw/video-production/vendor/video-pipeline-sdk/deps/remotion"
 _ENV_TOOLS_CACHE: dict = {"ts": 0.0, "data": None}
 _ENV_JOBS: dict[str, dict] = {}
 
@@ -1091,7 +1092,8 @@ async def api_env_tools(refresh: bool = False):
         return _ENV_TOOLS_CACHE["data"]
     try:
         proc = await asyncio.to_thread(lambda: subprocess.run(
-            [sys.executable, str(INSTALL_TOOL), "--json", "check"],
+            [sys.executable, str(INSTALL_TOOL), "--python", sys.executable, "--json", "check",
+             "--dir", str(REMOTION_DIR)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=240, cwd=str(PROJECT_ROOT)))
     except subprocess.TimeoutExpired:
@@ -1151,7 +1153,8 @@ async def api_env_install(req: EnvInstallRequest):
         proc = None
         try:
             proc = subprocess.Popen(
-                [sys.executable, str(INSTALL_TOOL), "--json", "install", tid],
+                [sys.executable, str(INSTALL_TOOL), "--python", sys.executable, "--json", "install", tid,
+                 "--dir", str(REMOTION_DIR)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT))
             # stdout 必须**并发**抽干：串行地先读完 stderr 再读 stdout，子进程一旦往 stdout

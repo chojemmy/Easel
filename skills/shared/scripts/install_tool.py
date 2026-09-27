@@ -317,6 +317,8 @@ def check_tool(tool: Tool, python: str, dir_: str | None = None) -> dict:
                 import glob
                 g = glob.glob(os.path.join(dir_, "node_modules", ".remotion", "**",
                                            "chrome-headless-shell*"), recursive=True)
+                g = [p for p in g if os.path.isfile(p) and os.path.basename(p) in
+                     ("chrome-headless-shell", "chrome-headless-shell.exe") and os.path.getsize(p) > 0]
                 return {"id": tool.id, "state": "ok" if g else "missing",
                         "version": "已缓存" if g else None, "detail": None}
             ok, detail = _PYFN[name]()
