@@ -125,6 +125,11 @@ Ok '系统环境检查完成'
 Info '安装 OpenClaw...'
 if (-not (Get-Command openclaw -ErrorAction SilentlyContinue)) { & npm install -g openclaw@latest --loglevel warn; if ($LASTEXITCODE -ne 0) { Fail 'OpenClaw 安装失败。' } }
 Require-Command 'openclaw' '请确认 npm 全局 bin 已加入 PATH。'
+if (-not (Get-Command bobo -ErrorAction SilentlyContinue)) {
+    & npm install -g '@apibobo-ai/cli@0.1.1' --loglevel warn --proxy 'http://127.0.0.1:7890' --https-proxy 'http://127.0.0.1:7890'
+    if ($LASTEXITCODE -ne 0) { Fail 'APIBOBO CLI 安装失败。请确认 Clash 127.0.0.1:7890 已启动。' }
+}
+Require-Command 'bobo' '请确认 npm 全局 bin 已加入 PATH。'
 Info '安装 Easel Python 依赖...'
 & $Python -m pip install --upgrade pip --progress-bar on
 if ($LASTEXITCODE -ne 0) { Fail 'pip 升级失败。' }
@@ -190,7 +195,13 @@ if ([string]::IsNullOrWhiteSpace($workspace)) {
 Info "  workspace → $workspace"
 $skills = Join-Path $workspace 'skills'
 New-Item -ItemType Directory -Force -Path $skills | Out-Null
-if (Test-Path (Join-Path $Root 'skills\openclaw')) { Copy-Item (Join-Path $Root 'skills\openclaw\*') $skills -Recurse -Force }
+if (Test-Path (Join-Path $Root 'skills\openclaw')) {
+    # Shared skills are junctions back to AGENT_VAULT. Do not materialize a
+    # second editable copy while populating the OpenClaw workspace.
+    Get-ChildItem (Join-Path $Root 'skills\openclaw') | Where-Object {
+        -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    } | ForEach-Object { Copy-Item $_.FullName $skills -Recurse -Force }
+}
 Copy-Item (Join-Path $Root 'openclaw\workspace\*.md') $workspace -Force -ErrorAction SilentlyContinue
 $context = Join-Path $workspace 'CONTEXT.md'
 @"
@@ -209,11 +220,11 @@ Ensure-Junction $profilesLink (Join-Path $Root 'profiles') 'Profiles Junction'
 $outputs = Join-Path $workspace 'outputs'
 Ensure-Junction $outputs (Join-Path $Root 'outputs') 'Outputs Junction'
 
-# Shared Remotion skills have a single source of truth in AGENT_VAULT.  Link
+# Shared agent skills have a single source of truth in AGENT_VAULT. Link
 # them into the Easel workspace instead of copying another editable version.
 if ($env:AGENT_VAULT) {
     $sharedSkillRoot = Join-Path $env:AGENT_VAULT 'skills'
-    foreach ($sharedSkillName in @('remotion-best-practices', 'remotion-video-production')) {
+    foreach ($sharedSkillName in @('apibobo', 'remotion-best-practices', 'remotion-video-production')) {
         $sharedSkillSource = Join-Path $sharedSkillRoot $sharedSkillName
         if (Test-Path -LiteralPath $sharedSkillSource -PathType Container) {
             Ensure-Junction (Join-Path $skills $sharedSkillName) $sharedSkillSource "Shared skill $sharedSkillName"

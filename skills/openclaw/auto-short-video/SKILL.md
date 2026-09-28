@@ -35,7 +35,9 @@ layer: produce
 
 4. **字幕**：用 TTS 附带的 SRT，或对配音跑 [auto-subtitle](../auto-subtitle/SKILL.md)；也可让 assemble 用各分镜 caption 自动生成。
 
-5. **BGM**：[ai-music](../ai-music/SKILL.md) 生成，或用用户提供的音乐。可选。
+5. **BGM**：可选。普通“需要背景音乐”固定按 [ai-music](../ai-music/SKILL.md) 的顺序执行：
+   `D:/Easel/assets/music-library` 本地授权曲库 → Mixkit 授权音乐网站；只有用户明确要求原创/AI 作曲时才调用付费音乐生成 API。
+   选曲后用 `ffprobe` 核对真实时长并试听语义，复制到 `outputs/主题名/assets/bgm.mp3`，不得把旁白或测试音频误当 BGM。
 
 6. **合成成片**：把上面的素材写成 storyboard JSON，调合成器：
    ```bash
@@ -67,6 +69,7 @@ layer: produce
 
 - **零件可缺**：缺图像/视频/TTS API key 的环节自动降级（图卡兜底 / 跳过配音），不阻断整体，并如实告知用户降级了什么。
 - **先出 Plan**：涉及多个付费 API（生图/生视频/生乐）时，先向用户说明将调用哪些、大致耗时/花费，确认后再跑。
+- **BGM 不抢旁白**：口播片默认选无人声曲，混音音量 0.08–0.18，头尾做淡入淡出；音乐不足时按乐句裁剪或换曲，不用突兀循环凑时长。
 - **中间产物留档**：分镜图、配音、字幕和 storyboard 都写进 `outputs/主题名/assets/`，方便单独替换后重新合成。
 
 ## Profile 感知

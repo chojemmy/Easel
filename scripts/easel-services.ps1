@@ -6,6 +6,8 @@ param(
 
     [string]$OnePasswordItem = 'minimax api',
     [string]$OnePasswordField = '',
+    [string]$ApiboboOnePasswordItem = 'apibobo',
+    [string]$ApiboboOnePasswordField = '',
     [switch]$RotateMediaToken,
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -77,6 +79,45 @@ function New-MediaToken {
     }
 }
 
+function Get-OnePasswordCredential(
+    [string]$OpPath,
+    [string]$ItemName,
+    [string]$FieldName,
+    [string]$Label
+) {
+    Write-Status "Requesting the '$ItemName' item from 1Password for $Label..."
+    $raw = & $OpPath item get $ItemName --format json --reveal
+    if ($LASTEXITCODE -ne 0) {
+        throw "1Password did not return the requested $Label item."
+    }
+    try {
+        $item = $raw | ConvertFrom-Json
+        $fields = @($item.fields | Where-Object {
+            $_.type -eq 'CONCEALED' -and -not [string]::IsNullOrWhiteSpace([string]$_.value)
+        })
+        if ($FieldName) {
+            $fields = @($fields | Where-Object { $_.label -eq $FieldName -or $_.id -eq $FieldName })
+        }
+        if ($fields.Count -ne 1) {
+            throw "Expected exactly one concealed credential field for $Label; found $($fields.Count). Select a field explicitly."
+        }
+        return [pscustomobject]@{
+            PlainText = [string]$fields[0].value
+            Source = [ordered]@{
+                provider = '1Password'
+                itemId = [string]$item.id
+                itemTitle = [string]$item.title
+                fieldId = [string]$fields[0].id
+                fieldLabel = [string]$fields[0].label
+            }
+        }
+    } finally {
+        $raw = $null
+        $item = $null
+        $fields = $null
+    }
+}
+
 function Import-FromOnePassword {
     Ensure-LocalState
     $op = Get-Command op -ErrorAction SilentlyContinue
@@ -84,25 +125,12 @@ function Import-FromOnePassword {
         throw '1Password CLI (op) was not found.'
     }
 
-    Write-Status "Requesting the '$OnePasswordItem' item from 1Password..."
-    $raw = & $op.Source item get $OnePasswordItem --format json --reveal
-    if ($LASTEXITCODE -ne 0) {
-        throw '1Password did not return the requested item.'
-    }
-    $item = $raw | ConvertFrom-Json
-    $fields = @($item.fields | Where-Object {
-        $_.type -eq 'CONCEALED' -and -not [string]::IsNullOrWhiteSpace([string]$_.value)
-    })
-    if ($OnePasswordField) {
-        $fields = @($fields | Where-Object { $_.label -eq $OnePasswordField -or $_.id -eq $OnePasswordField })
-    }
-    if ($fields.Count -ne 1) {
-        throw "Expected exactly one concealed credential field; found $($fields.Count). Use -OnePasswordField to select one."
-    }
-
-    $plainKey = [string]$fields[0].value
-    if ([string]::IsNullOrWhiteSpace($plainKey)) {
-        throw 'The selected 1Password credential is empty.'
+    $minimaxCredential = Get-OnePasswordCredential $op.Source $OnePasswordItem $OnePasswordField 'MiniMax'
+    $apiboboCredential = Get-OnePasswordCredential $op.Source $ApiboboOnePasswordItem $ApiboboOnePasswordField 'APIBOBO'
+    $plainKey = [string]$minimaxCredential.PlainText
+    $apiboboKey = [string]$apiboboCredential.PlainText
+    if ([string]::IsNullOrWhiteSpace($plainKey) -or [string]::IsNullOrWhiteSpace($apiboboKey)) {
+        throw 'A selected 1Password credential is empty.'
     }
 
     $mediaToken = $null
@@ -122,17 +150,15 @@ function Import-FromOnePassword {
 
     try {
         $payload = [ordered]@{
-            version = 1
+            version = 2
             protection = 'Windows DPAPI CurrentUser'
             importedAt = [DateTimeOffset]::Now.ToString('o')
-            source = [ordered]@{
-                provider = '1Password'
-                itemId = [string]$item.id
-                itemTitle = [string]$item.title
-                fieldId = [string]$fields[0].id
-                fieldLabel = [string]$fields[0].label
+            sources = [ordered]@{
+                minimax = $minimaxCredential.Source
+                apibobo = $apiboboCredential.Source
             }
             minimaxApiKey = Protect-Text $plainKey
+            apiboboApiKey = Protect-Text $apiboboKey
             easelMediaToken = Protect-Text $mediaToken
         }
         $json = $payload | ConvertTo-Json -Depth 8
@@ -145,10 +171,10 @@ function Import-FromOnePassword {
         }
     } finally {
         $plainKey = $null
+        $apiboboKey = $null
         $mediaToken = $null
-        $raw = $null
-        $item = $null
-        $fields = $null
+        $minimaxCredential = $null
+        $apiboboCredential = $null
         $payload = $null
         $json = $null
         [GC]::Collect()
@@ -181,17 +207,20 @@ function Import-ProtectedEnvironment {
         throw 'Unsupported Easel secret-store format.'
     }
     $minimax = Unprotect-Text ([string]$store.minimaxApiKey)
+    $apibobo = if ($store.apiboboApiKey) { Unprotect-Text ([string]$store.apiboboApiKey) } else { '' }
     $media = Unprotect-Text ([string]$store.easelMediaToken)
-    if ([string]::IsNullOrWhiteSpace($minimax) -or [string]::IsNullOrWhiteSpace($media)) {
-        throw 'The Easel secret store is incomplete.'
+    if ([string]::IsNullOrWhiteSpace($minimax) -or [string]::IsNullOrWhiteSpace($apibobo) -or [string]::IsNullOrWhiteSpace($media)) {
+        throw 'The Easel secret store is incomplete. Re-run import-1password to import MiniMax and APIBOBO.'
     }
     try {
         $env:MINIMAX_API_KEY = $minimax
+        $env:APIBOBO_KEY = $apibobo
         $env:EASEL_MEDIA_TOKEN = $media
         $env:EASEL_ROOT = $Root
         Import-DotEnv
     } finally {
         $minimax = $null
+        $apibobo = $null
         $media = $null
         $store = $null
     }
@@ -199,7 +228,7 @@ function Import-ProtectedEnvironment {
 
 function Clear-ProtectedEnvironment {
     foreach ($name in @(
-        'MINIMAX_API_KEY', 'EASEL_MEDIA_TOKEN',
+        'MINIMAX_API_KEY', 'APIBOBO_KEY', 'EASEL_MEDIA_TOKEN',
         'EASEL_LLM_API_KEY', 'IMG_API_KEY', 'VIDEO_API_KEY', 'EASEL_EMBEDDING_API_KEY'
     )) {
         Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
@@ -236,9 +265,11 @@ function Stop-ManagedPort([int]$Port, [string]$Kind) {
         throw "Port $Port is owned by an unexpected process (PID $($process.ProcessId)); refusing to stop it."
     }
     Stop-Process -Id $process.ProcessId -Force
-    1..30 | ForEach-Object {
-        if (Get-PortProcess $Port) { Start-Sleep -Milliseconds 200 }
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        if (-not (Get-PortProcess $Port)) { return }
+        Start-Sleep -Milliseconds 200
     }
+    throw "Easel $Kind process did not release port $Port."
 }
 
 function Test-Http([string]$Url) {
@@ -329,8 +360,18 @@ function Test-SecureIntegration {
         $quotaBody = $quota.Content | ConvertFrom-Json
         if ($null -eq $quotaBody.rows) { throw 'The MiniMax quota response was not recognized.' }
         Write-Status "MiniMax Token Plan credential: OK ($(@($quotaBody.rows).Count) quota rows)"
+
+        $bobo = Get-Command bobo -ErrorAction SilentlyContinue
+        if (-not $bobo) { throw 'APIBOBO CLI (bobo) was not found.' }
+        $balanceRaw = & $bobo.Source balance -j 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'APIBOBO rejected the protected credential.' }
+        $balanceBody = $balanceRaw | ConvertFrom-Json
+        if ($null -eq $balanceBody) { throw 'The APIBOBO balance response was not recognized.' }
+        Write-Status 'APIBOBO credential: OK'
     } finally {
         $headers = $null
+        $balanceRaw = $null
+        $balanceBody = $null
         Clear-ProtectedEnvironment
     }
 }

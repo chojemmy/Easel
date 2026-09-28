@@ -104,9 +104,16 @@ MODEL_GROUPS: dict[str, dict[str, Any]] = {
         "label": "AI 音乐 / BGM",
         "settings": [
             _key("MUSIC_PROVIDER", "默认音乐 provider", required=False, secret=False,
-                 choices=("dashscope", "suno-compatible")),
+                 choices=("local-library", "dashscope", "suno-compatible")),
         ],
         "providers": [
+            {
+                "id": "local-library", "name": "本地 BGM 曲库（默认优先、无 API 费用）", "keys": [
+                    _key("BGM_LIBRARY_DIR", "本地曲库目录", secret=False),
+                    _key("BGM_SOURCE_SITE", "无合适曲目时的授权音乐网站", required=False,
+                         secret=False),
+                ],
+            },
             {
                 "id": "dashscope", "name": "阿里 DashScope", "keys": [
                     _key("DASHSCOPE_API_KEY", "DashScope API Key",

@@ -12,11 +12,19 @@ Web 服务和 OpenClaw Gateway 都需要继承以下环境变量（密钥由密�
 
 ```dotenv
 MINIMAX_API_KEY=<Token Plan key>
+EASEL_LLM_API_KEY=${MINIMAX_API_KEY}
+EASEL_LLM_BASE_URL=https://api.minimax.cn/anthropic
+CLAUDE_MODEL=minimax/MiniMax-M3.1-Flash-Preview
+EASEL_THINKING_LEVEL=adaptive
 MINIMAX_BASE_URL=https://api.minimaxi.com
 VOICE_PROVIDER=minimax
 MINIMAX_MODEL=speech-2.8-hd
 VOICE_NARRATOR_VOICE_ID=Chinese (Mandarin)_Gentleman
 ```
+
+`CLAUDE_MODEL` 是 Easel/OpenClaw 的文本模型，固定为 Token Plan 支持的
+`MiniMax-M3.1-Flash-Preview`；`MINIMAX_MODEL=speech-2.8-hd` 只用于 TTS，二者不能互相覆盖。
+文本模型参数与端点以 [MiniMax 官方模型调用文档](https://platform.minimax.cn/docs/guides/text-generation) 为准。
 
 不要把真实密钥提交到 Git。Windows 可使用当前用户 DPAPI 保存凭证后在启动时解密注入。
 网页 `.env` 支持 `${ENV_NAME}` 引用；Gateway 的工作目录不同，因此所有媒体 URL、模型名和密钥都应一起传入进程环境。

@@ -367,6 +367,15 @@ def _short_drama_spec() -> dict:
     }
 
 SKILL_API_REQUIREMENTS: dict[str, dict] = {
+    "apibobo": {
+        "label": "APIBOBO 工具市场",
+        "settings": [],
+        "providers": [{
+            "id": "apibobo",
+            "name": "APIBOBO CLI / Tool API",
+            "keys": [_k("APIBOBO_KEY", "APIBOBO API Key")],
+        }],
+    },
     "ai-image-gen": _model_spec("image"),
     "ecom-details-image": _model_spec("image", "电商配图（AI 生图）"),
     "ai-video-gen": _model_spec("video"),

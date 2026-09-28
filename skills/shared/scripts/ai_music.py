@@ -3,6 +3,7 @@
 
 给短视频 / 社媒内容生成原创背景音乐（BGM / 配乐 / 纯音乐），支持可插拔 provider：
 
+  - local-library     从本地授权曲库按提示词确定性选曲并复制到项目输出
   - dashscope        阿里云 DashScope（百炼）音频/音乐生成，异步任务 + 轮询
   - suno-compatible  Suno 类第三方 API 的通用格式（异步提交 → 轮询 → 下载）
 
@@ -11,7 +12,11 @@
 配置来自环境变量或 .env 文件（脚本会从当前目录向上查找 .env）：
 
   【通用】
-    MUSIC_PROVIDER       选择 provider（dashscope / suno-compatible），也可用 --provider
+    MUSIC_PROVIDER       选择 provider（local-library / dashscope / suno-compatible），也可用 --provider
+
+  【local-library】
+    BGM_LIBRARY_DIR      本地 BGM 曲库目录（必填）
+    BGM_SOURCE_SITE      曲库不匹配时供 Agent 查找授权音乐的网站（可选）
 
   【dashscope】
     DASHSCOPE_API_KEY    API key（别名：DASHSCOPE_KEY / ALIYUN_API_KEY）
@@ -45,6 +50,8 @@ import argparse
 import http.client
 import json
 import os
+import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -65,6 +72,7 @@ UA = (
 DEFAULT_DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_DASHSCOPE_MODEL = "audio-generation"
 DEFAULT_SUNO_MODEL = "music-1"
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
 # 每个 provider 声明所需 env（主名 → 别名元组）。check / 报错都基于这份声明。
 PROVIDERS = provider_ids("music")
@@ -145,6 +153,69 @@ def resolve_provider(explicit: str | None) -> str:
     if provider not in PROVIDERS:
         fail(f"不支持的 provider：{provider}。可选：{ '、'.join(PROVIDERS) }。")
     return provider
+
+
+def _library_metadata(root: Path) -> dict[str, dict[str, Any]]:
+    """Read optional local metadata without making it a hard dependency."""
+    index = root / "library.json"
+    if not index.is_file():
+        return {}
+    try:
+        payload = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in payload.get("tracks", []) if isinstance(payload, dict) else []:
+        if isinstance(item, dict) and isinstance(item.get("file"), str):
+            result[item["file"].replace("\\", "/").casefold()] = item
+    return result
+
+
+def _local_track_score(path: Path, root: Path, prompt: str,
+                       metadata: dict[str, dict[str, Any]]) -> int:
+    relative = path.relative_to(root).as_posix()
+    item = metadata.get(relative.casefold(), {})
+    query = prompt.casefold()
+    fields = [path.stem, str(item.get("title", ""))]
+    for key in ("tags", "moods", "useCases", "instruments"):
+        value = item.get(key, [])
+        fields.extend(value if isinstance(value, list) else [str(value)])
+    terms = [str(value).strip().casefold() for value in fields if str(value).strip()]
+    score = sum(5 for term in terms if term in query)
+    prompt_words = re.findall(r"[a-z0-9_-]{2,}", query)
+    haystack = " ".join(terms)
+    return score + sum(1 for word in prompt_words if word in haystack)
+
+
+def generate_local_library(args: argparse.Namespace) -> Path:
+    """Select an existing licensed track deterministically; never calls a paid API."""
+    if args.lyrics:
+        fail("local-library 只选择现成 BGM，不支持歌词；需要原创歌曲时请显式选择生成 provider。")
+    raw_root = require_env("BGM_LIBRARY_DIR")
+    root = Path(raw_root).expanduser()
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    root = root.resolve()
+    if not root.is_dir():
+        fail(f"本地 BGM 曲库不存在：{root}")
+    candidates = sorted(
+        (path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+    if not candidates:
+        site = env_lookup("BGM_SOURCE_SITE")
+        suffix = f"；可从授权网站补充：{site}" if site else ""
+        fail(f"本地 BGM 曲库为空：{root}{suffix}")
+    metadata = _library_metadata(root)
+    chosen = max(candidates, key=lambda path: (_local_track_score(path, root, args.prompt, metadata),
+                                                -candidates.index(path)))
+    output = Path(args.output)
+    if output.suffix.lower() != chosen.suffix.lower():
+        fail(f"local-library 不做转码；输出扩展名必须是 {chosen.suffix}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(chosen, output)
+    print(f"[local-library] 已选择：{chosen.relative_to(root).as_posix()}", file=sys.stderr)
+    return output
 
 
 # ── HTTP 工具 ──────────────────────────────────────────────
@@ -403,6 +474,7 @@ def _extract_suno_status(result: dict[str, Any]) -> str:
 PROVIDER_REQUIRED_ENV = provider_required_env("music")
 
 PROVIDER_GENERATORS = {
+    "local-library": generate_local_library,
     "dashscope": generate_dashscope,
     "suno-compatible": generate_suno,
 }
@@ -461,7 +533,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai_music.py",
-        description="AI 音乐 / BGM 生成的可插拔客户端（dashscope / suno-compatible），纯标准库。",
+        description="BGM 本地选曲与 AI 音乐生成客户端（local-library / dashscope / suno-compatible），纯标准库。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="cmd", metavar="<子命令>")

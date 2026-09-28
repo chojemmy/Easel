@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from easel.commands import skill as cli_skill  # noqa: E402
 from easel import persona  # noqa: E402
 import app as web  # noqa: E402
+import ai_music  # noqa: E402
 import paper_ingest  # noqa: E402
 import render_slides  # noqa: E402
 from model_registry import (configured_providers, env_aliases, provider_ids,
@@ -47,6 +49,31 @@ def test_media_registry_separates_dashscope_model_names():
     assert "DASHSCOPE_VIDEO_MODEL" in video_fields
     assert "DASHSCOPE_MUSIC_MODEL" in music_fields
     assert env_aliases("video")["DASHSCOPE_VIDEO_MODEL"] == ("DASHSCOPE_MODEL",)
+
+
+def test_local_bgm_library_is_a_configured_no_api_provider(tmp_path):
+    providers = configured_providers("music", {"BGM_LIBRARY_DIR": str(tmp_path)})
+    assert [provider["id"] for provider in providers] == ["local-library"]
+    assert "APIBOBO_KEY" in web._ENV_ALLOWLIST
+
+
+def test_local_bgm_selection_uses_library_metadata(tmp_path, monkeypatch):
+    library = tmp_path / "music"
+    library.mkdir()
+    (library / "bright.mp3").write_bytes(b"bright")
+    (library / "calm.mp3").write_bytes(b"calm")
+    (library / "library.json").write_text(json.dumps({"tracks": [
+        {"file": "bright.mp3", "tags": ["轻快", "活力"]},
+        {"file": "calm.mp3", "tags": ["克制", "科技感"]},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("BGM_LIBRARY_DIR", str(library))
+    output = tmp_path / "selected.mp3"
+
+    selected = ai_music.generate_local_library(SimpleNamespace(
+        lyrics=None, prompt="克制的科技感知识视频", output=str(output)))
+
+    assert selected == output
+    assert output.read_bytes() == b"calm"
 
 
 def test_configured_media_providers_lists_choices_without_keys():

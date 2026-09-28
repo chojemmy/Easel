@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "policy": {
+    "priority": ["local-library", "licensed-source-site", "explicit-ai-generation"],
+    "fallbackSite": "https://mixkit.co/free-stock-music/",
+    "note": "Verify the current item license before redistribution. Narration, voice tests, and SFX do not belong in this library."
+  },
+  "tracks": [
+    {
+      "file": "mixkit-pop-05-695.mp3",
+      "title": "Mixkit Pop 05 695",
+      "origin": "User-provided prior download",
+      "sourceSite": "https://mixkit.co/free-stock-music/",
+      "license": "Mixkit License; verify the source item terms for the intended use",
+      "durationSeconds": 154.105261,
+      "sha256": "68C6C8358B8761C55142B705C7A3C9E7F687108E0FD94E5A49C479740304D72F",
+      "tags": ["pop", "轻快", "活力", "背景音乐"],
+      "moods": ["明快", "积极"],
+      "useCases": ["短视频", "vlog", "片头"]
+    }
+  ]
+}

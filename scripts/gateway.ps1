@@ -32,10 +32,13 @@ switch ($args[0]) {
         Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $command `
             -WorkingDirectory $Root -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLogFile -WindowStyle Hidden | Out-Null
         $ready = $false
-        1..20 | ForEach-Object {
+        # First boot can spend 20-40 seconds loading providers/plugins before
+        # the health endpoint is ready. Keep the visible launcher honest by
+        # waiting for readiness instead of reporting a false failure.
+        1..120 | ForEach-Object {
             if (-not $ready) {
                 if (Test-Gateway) { $ready = $true }
-                else { Start-Sleep -Seconds 1 }
+                else { Start-Sleep -Milliseconds 500 }
             }
         }
         if ($ready) { Write-Host '[easel] Gateway started' }
