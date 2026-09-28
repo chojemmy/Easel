@@ -141,12 +141,57 @@ def _skills_synced() -> tuple[bool, str]:
     return ok, f"agent 实际读取的 workspace 是 {ws}，其中 skills/ 为空或不存在"
 
 
+_ENV_REF_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _read_dotenv_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def _resolved_env_value(value: object, dotenv: dict[str, str], seen: set[str] | None = None) -> str:
+    """Resolve a simple ${NAME} chain without executing dotenv content."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().strip('"').strip("'")
+    if not value or re.search(r"REPLACE_ME|your[-_ ]?api[-_ ]?key", value, re.I):
+        return ""
+    match = _ENV_REF_RE.fullmatch(value)
+    if not match:
+        return value
+    name = match.group(1)
+    seen = set() if seen is None else set(seen)
+    if name in seen:
+        return ""
+    seen.add(name)
+    process_value = os.environ.get(name, "")
+    if process_value and process_value != value:
+        return _resolved_env_value(process_value, dotenv, seen)
+    nested = dotenv.get(name, "")
+    if nested and nested != value:
+        return _resolved_env_value(nested, dotenv, seen)
+    return ""
+
+
 def _env_key_valid() -> bool:
     """Check .env 配置了可用的认证。
 
     以下任一通道满足即可：
     - 标准 API key：ANTHROPIC_API_KEY
     - Anthropic-compatible 服务：EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL
+    - MiniMax Token Plan：MINIMAX_API_KEY
 
     ping 才是权威连通性测试；这里只做静态配置存在性检查。
     """
@@ -155,27 +200,17 @@ def _env_key_valid() -> bool:
         return False
 
     # 认证变量 → 是否已填入非占位值
-    auth_vars: dict[str, str] = {}
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            if key in (
-                "ANTHROPIC_API_KEY", "EASEL_LLM_API_KEY", "EASEL_LLM_BASE_URL",
-                "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                "OPENAI_API_KEY", "OPENAI_BASE_URL",
-                "OPENAI_MAAS_API_KEY", "OPENAI_MAAS_ENDPOINT",
-            ):
-                auth_vars[key] = value
-    except OSError:
-        return False
+    values = _read_dotenv_values(env_file)
+    auth_vars = {key: values.get(key, "") for key in (
+        "ANTHROPIC_API_KEY", "EASEL_LLM_API_KEY", "EASEL_LLM_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "OPENAI_MAAS_API_KEY", "OPENAI_MAAS_ENDPOINT",
+        "MINIMAX_API_KEY",
+    )}
 
     def _set(name: str) -> bool:
-        v = auth_vars.get(name, "")
-        return bool(v) and "REPLACE_ME" not in v
+        return bool(_resolved_env_value(auth_vars.get(name, ""), values))
 
     # 标准 key 通道
     if _set("ANTHROPIC_API_KEY"):
@@ -186,6 +221,8 @@ def _env_key_valid() -> bool:
     if _set("ANTHROPIC_AUTH_TOKEN") and _set("ANTHROPIC_BASE_URL"):
         return True
     if _set("OPENAI_API_KEY"):
+        return True
+    if _set("MINIMAX_API_KEY"):
         return True
     if _set("OPENAI_MAAS_API_KEY") and _set("OPENAI_MAAS_ENDPOINT"):
         return True
@@ -232,9 +269,16 @@ def _primary_model_routable() -> tuple[bool, str]:
         return False, (f"primary 是 {primary}，但 models.providers.{provider} 不存在 —— "
                        "在 .env 填好真实 key 后重新跑 setup 脚本")
     # apiKey / 本地适配器 / OAuth 任一即可。字段名随 OpenClaw 版本变过，这里从宽认。
-    has_auth = bool(str(entry.get("apiKey") or "").strip()) or bool(entry.get("localService")) \
+    api_key = entry.get("apiKey")
+    dotenv = _read_dotenv_values(PROJECT_ROOT / ".env")
+    has_auth = bool(api_key) if isinstance(api_key, dict) else bool(_resolved_env_value(api_key, dotenv))
+    has_auth = has_auth or bool(entry.get("localService")) \
         or any(k for k, v in entry.items() if "oauth" in k.lower() and v)
     if not has_auth:
+        ref = _ENV_REF_RE.fullmatch(api_key.strip()) if isinstance(api_key, str) else None
+        if ref:
+            return False, (f"models.providers.{provider}.apiKey 引用了未注入的环境变量 "
+                           f"{ref.group(1)} —— 请从本机 Secret 管理器注入后重启 Gateway")
         return False, (f"models.providers.{provider} 没有 apiKey —— "
                        "在 .env 填好真实 key 后重新跑 setup 脚本")
     return True, ""
@@ -289,7 +333,8 @@ def cmd_doctor(_args) -> int:
     # 3. .env file with valid key
     env_ok = _env_key_valid()
     all_ok &= _check(".env (API Key)", env_ok,
-                      "填 ANTHROPIC_API_KEY，或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL")
+                      "从本机 Secret 管理器注入 MINIMAX_API_KEY / ANTHROPIC_API_KEY，"
+                      "或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL")
 
     # .env 填了 ≠ setup 真的把 provider 写进了 openclaw；不对账就会「doctor 全绿但对话报错」。
     route_ok, route_detail = _primary_model_routable()
@@ -318,8 +363,11 @@ def cmd_doctor(_args) -> int:
 
     print()
     if all_ok:
-        print(f"{GREEN}✓ 环境就绪{NC} — 运行 python -m easel ping 验证连通性")
+        # Windows terminals may still use a legacy code page (for example GBK).
+        # Keep the final status ASCII-only so a successful doctor run cannot fail
+        # with UnicodeEncodeError merely while printing the checkmark.
+        print(f"{GREEN}[OK] 环境就绪{NC} — 运行 python -m easel ping 验证连通性")
     else:
-        print(f"{YELLOW}⚠ 有未满足项{NC} — 请按上述提示修复后重试")
+        print(f"{YELLOW}[WARN] 有未满足项{NC} — 请按上述提示修复后重试")
 
     return 0 if all_ok else 1

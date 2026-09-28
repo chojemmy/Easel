@@ -417,7 +417,7 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
-    minimax_service.worker = asyncio.create_task(minimax_service.loop())
+    await minimax_service.start()
     try:
         yield
     finally:

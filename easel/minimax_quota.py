@@ -258,11 +258,26 @@ class QuotaService:
             except asyncio.TimeoutError:
                 pass
 
+    async def start(self):
+        """Start the worker with primitives owned by the current event loop.
+
+        Test clients and development reloaders may run multiple application
+        lifespans in one process.  asyncio synchronization objects must not be
+        reused across those event loops.
+        """
+        if self.worker and not self.worker.done():
+            return
+        self.lock = asyncio.Lock()
+        self.settings_changed = asyncio.Event()
+        self.worker = asyncio.create_task(self.loop())
+
     async def stop(self):
-        if self.worker:
-            self.worker.cancel()
+        worker = self.worker
+        self.worker = None
+        if worker:
+            worker.cancel()
             try:
-                await self.worker
+                await worker
             except asyncio.CancelledError:
                 pass
 

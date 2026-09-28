@@ -9,6 +9,28 @@ function Info($Message) { Write-Host "[easel] $Message" -ForegroundColor Cyan }
 function Ok($Message) { Write-Host "  [OK] $Message" -ForegroundColor Green }
 function Fail($Message) { Write-Error $Message; exit 1 }
 function Require-Command($Name, $Hint) { if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) { Fail "$Name 未找到。$Hint" } }
+function Ensure-Junction($Path, $Target, $Label) {
+    $targetFull = [System.IO.Path]::GetFullPath($Target).TrimEnd('\')
+    # Get-Item also sees a broken junction, while Test-Path may report it as absent.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        if ($item.LinkType -ne 'Junction') {
+            Fail "$Path 已存在但不是 Junction，请移走后重试。"
+        }
+        $currentTarget = @($item.Target)[0]
+        if (-not [System.IO.Path]::IsPathRooted($currentTarget)) {
+            $currentTarget = Join-Path $item.Parent.FullName $currentTarget
+        }
+        $currentFull = [System.IO.Path]::GetFullPath($currentTarget).TrimEnd('\')
+        if ($currentFull -ieq $targetFull) { return }
+
+        # Directory.Delete removes the junction itself without traversing its target.
+        [System.IO.Directory]::Delete($item.FullName)
+    }
+    New-Item -ItemType Directory -Force -Path $targetFull | Out-Null
+    New-Item -ItemType Junction -Path $Path -Target $targetFull | Out-Null
+    Ok "$Label -> $targetFull"
+}
 function Ensure-Command($Name, $PackageId, $Hint) {
     if (Get-Command $Name -ErrorAction SilentlyContinue) { return }
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Fail "$Name 未找到。$Hint`n也可以先安装 Windows App Installer（winget）后重试。" }
@@ -183,16 +205,21 @@ $shared = Join-Path $workspace 'shared'
 if (Test-Path $shared) { Remove-Item $shared -Recurse -Force }
 if (Test-Path (Join-Path $Root 'skills\shared')) { Copy-Item (Join-Path $Root 'skills\shared') $shared -Recurse -Force }
 $profilesLink = Join-Path $workspace 'easel-profiles'
-if (Test-Path $profilesLink) {
-    $profileItem = Get-Item $profilesLink -Force
-    if ($profileItem.LinkType -ne 'Junction') { Fail "$profilesLink 已存在但不是项目 profiles Junction，请移走后重试。" }
-} else { New-Item -ItemType Junction -Path $profilesLink -Target (Join-Path $Root 'profiles') | Out-Null }
+Ensure-Junction $profilesLink (Join-Path $Root 'profiles') 'Profiles Junction'
 $outputs = Join-Path $workspace 'outputs'
-New-Item -ItemType Directory -Force -Path (Join-Path $Root 'outputs') | Out-Null
-if (Test-Path $outputs) {
-    $outputsItem = Get-Item $outputs -Force
-    if ($outputsItem.LinkType -ne 'Junction') { Fail "$outputs 已存在但不是项目 outputs Junction，请移走后重试。" }
-} else { New-Item -ItemType Junction -Path $outputs -Target (Join-Path $Root 'outputs') | Out-Null }
+Ensure-Junction $outputs (Join-Path $Root 'outputs') 'Outputs Junction'
+
+# Shared Remotion skills have a single source of truth in AGENT_VAULT.  Link
+# them into the Easel workspace instead of copying another editable version.
+if ($env:AGENT_VAULT) {
+    $sharedSkillRoot = Join-Path $env:AGENT_VAULT 'skills'
+    foreach ($sharedSkillName in @('remotion-best-practices', 'remotion-video-production')) {
+        $sharedSkillSource = Join-Path $sharedSkillRoot $sharedSkillName
+        if (Test-Path -LiteralPath $sharedSkillSource -PathType Container) {
+            Ensure-Junction (Join-Path $skills $sharedSkillName) $sharedSkillSource "Shared skill $sharedSkillName"
+        }
+    }
+}
 
 $envPath = Join-Path $Root '.env'
 if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $Root '.env.example') $envPath }

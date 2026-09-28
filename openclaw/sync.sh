@@ -37,6 +37,12 @@ fi
 OPENCLAW_SKILL_DST="$OPENCLAW_WORKSPACE_DST/skills"
 OPENCLAW_WORKSPACE_SRC="$SCRIPT_DIR/workspace"
 OPENCLAW_SKILL_SRC="$PROJECT_ROOT/skills/openclaw"
+SHARED_AGENT_SKILL_SRC=""
+if [ -n "${AGENT_VAULT:-}" ] && [ -d "$AGENT_VAULT/skills" ]; then
+    SHARED_AGENT_SKILL_SRC="$AGENT_VAULT/skills"
+elif [ -d "$HOME/Documents/第二大脑/_Agent/skills" ]; then
+    SHARED_AGENT_SKILL_SRC="$HOME/Documents/第二大脑/_Agent/skills"
+fi
 
 echo "[easel] Syncing to OpenClaw profile: $PROFILE"
 echo "  workspace → $OPENCLAW_WORKSPACE_DST"
@@ -51,7 +57,8 @@ mkdir -p "$OPENCLAW_WORKSPACE_DST"
 for dst_dir in "$OPENCLAW_SKILL_DST"/*/; do
     [ -d "$dst_dir" ] || continue
     name=$(basename "$dst_dir")
-    if [ ! -d "$OPENCLAW_SKILL_SRC/$name" ]; then
+    if [ ! -d "$OPENCLAW_SKILL_SRC/$name" ] && \
+       { [ -z "$SHARED_AGENT_SKILL_SRC" ] || [ ! -d "$SHARED_AGENT_SKILL_SRC/$name" ]; }; then
         rm -rf "$dst_dir"
         echo "  ✗ $name (removed — no longer in source)"
     fi
@@ -72,6 +79,18 @@ for skill_dir in "$OPENCLAW_SKILL_SRC"/*/; do
 done
 echo "  ($synced skills synced)"
 echo ""
+
+# ---- 共享 Remotion skills（只链接真相源，不复制正文） ----
+if [ -n "$SHARED_AGENT_SKILL_SRC" ]; then
+    for name in remotion-best-practices remotion-video-production; do
+        src="$SHARED_AGENT_SKILL_SRC/$name"
+        [ -d "$src" ] || continue
+        rm -rf "$OPENCLAW_SKILL_DST/$name"
+        ln -s "$src" "$OPENCLAW_SKILL_DST/$name"
+        echo "  ✓ $name (shared -> $src)"
+    done
+    echo ""
+fi
 
 # ---- 同步 shared/ 跨 SKILL 共享层 ----
 # 多个 SKILL 用 ../../shared/xxx.md 引用（workspace 扁平化后解析为 workspace/shared/）

@@ -36,6 +36,18 @@ layer: produce
 2. **tier2 云端 ASR API**：没现成稿但配了 `SILICONFLOW_API_KEY`（env）→ 自动调硅基流动（默认 `XingChenAGI/XingChenGSR-V1.0`，可用 `SILICONFLOW_ASR_MODEL` / `SILICONFLOW_BASE_URL` 覆盖）。key 只从环境变量读，勿写进命令/仓库。
 3. **tier3 本地 whisper（兜底）**：都没有才用本地 large-v3（首次下约 3GB）。需 `faster-whisper`。
 
+### Remotion 写码前置标准（弱模型必须执行）
+
+进入写码阶段前，先加载 workspace 中的 `remotion-video-production` 与
+`remotion-best-practices` 两个 Skill。前者规定分镜、B-roll、字幕、卡片与质量门，
+后者提供 Remotion 官方当前 API 与 React 写法。不得跳过下列顺序：
+
+1. 先生成可审查的时间线/分镜表，再写 TSX；禁止边想分镜边写组件。
+2. 每个 B-roll 必须绑定一句台词并抽帧核对语义；其显示时长不得超过素材可用时长。
+3. 字幕必须来自带时间戳的 SRT/JSON/ASR，粗剪或变速后重建时间轴；禁止按字数估时。
+4. 卡片只在钩子、章节转换、数据/对比、金句或总结处出现，不得机械地每句一卡。
+5. 先过静态预检、`remotion compositions`、转场边界静帧和低码率预览，用户确认后才渲染全片。
+
 ### 让用户看得见（产物贴进对话 · 免上传）
 
 对话消息**直接支持图片与视频**（站内媒体通道 `/api/media/`，零上传、零改前端）。产物落盘后，把它们贴进消息、再配卡片：

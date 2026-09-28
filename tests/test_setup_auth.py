@@ -222,6 +222,37 @@ def test_doctor_catches_provider_without_key(tmp_path, monkeypatch):
     assert not ok and "没有 apiKey" in detail
 
 
+def test_doctor_catches_unresolved_env_secret(tmp_path, monkeypatch):
+    monkeypatch.delenv("EASEL_TEST_MISSING_SECRET", raising=False)
+    ok, detail = _routable(
+        tmp_path,
+        _cfg("minimax/model", {"minimax": {"apiKey": "${EASEL_TEST_MISSING_SECRET}"}}),
+        monkeypatch,
+    )
+    assert not ok and "EASEL_TEST_MISSING_SECRET" in detail
+
+
+def test_doctor_accepts_injected_env_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("EASEL_TEST_PRESENT_SECRET", "test-only-value")
+    ok, detail = _routable(
+        tmp_path,
+        _cfg("minimax/model", {"minimax": {"apiKey": "${EASEL_TEST_PRESENT_SECRET}"}}),
+        monkeypatch,
+    )
+    assert ok, detail
+
+
+def test_doctor_dotenv_reference_requires_injected_secret(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "MINIMAX_API_KEY=${EASEL_TEST_MINIMAX_SECRET}\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("EASEL_TEST_MINIMAX_SECRET", raising=False)
+    assert not doctor._env_key_valid()
+    monkeypatch.setenv("EASEL_TEST_MINIMAX_SECRET", "test-only-value")
+    assert doctor._env_key_valid()
+
+
 def test_doctor_catches_missing_primary(tmp_path, monkeypatch):
     ok, _ = _routable(tmp_path, {"models": {"providers": {"openai": {"apiKey": "sk-x"}}}}, monkeypatch)
     assert not ok
