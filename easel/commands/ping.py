@@ -29,7 +29,7 @@ def _step(label: str, cmd: list[str], timeout: int = 30,
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             env=env,
         )
         ok = result.returncode == 0
@@ -76,8 +76,9 @@ def cmd_ping(_args) -> int:
 
     print()
     if all_ok:
-        print(f"{GREEN}✓ 全部通过{NC}")
+        # Keep status markers ASCII-safe for Windows consoles using GBK/cp936.
+        print(f"{GREEN}[OK] 全部通过{NC}")
     else:
-        print(f"{RED}✗ 有步骤失败{NC} — 请运行 python -m easel doctor 检查环境")
+        print(f"{RED}[FAIL] 有步骤失败{NC} - 请运行 python -m easel doctor 检查环境")
 
     return 0 if all_ok else 1

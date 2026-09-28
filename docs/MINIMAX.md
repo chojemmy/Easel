@@ -21,6 +21,30 @@ VOICE_NARRATOR_VOICE_ID=Chinese (Mandarin)_Gentleman
 不要把真实密钥提交到 Git。Windows 可使用当前用户 DPAPI 保存凭证后在启动时解密注入。
 网页 `.env` 支持 `${ENV_NAME}` 引用；Gateway 的工作目录不同，因此所有媒体 URL、模型名和密钥都应一起传入进程环境。
 
+### Windows：从 1Password 安全导入并启动
+
+仓库提供统一启动器 `scripts/easel-services.ps1`。它调用 1Password CLI 读取凭据，随后只把密钥以
+Windows 当前用户 DPAPI 密文写入 `%LOCALAPPDATA%\Easel\secrets.dpapi.json`；明文不会写进项目、
+共享 `_Agent`、日志或 Git。首次导入时还会生成独立的随机 `EASEL_MEDIA_TOKEN`。
+
+```powershell
+# 首次运行，1Password 会要求当前用户授权
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 import-1password
+
+# 统一启动 / 重启 / 查看状态
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 start
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 restart
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 status
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 self-test
+
+# 让一次性诊断命令继承受保护凭据
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\easel-services.ps1 exec .\.venv\Scripts\easel.exe doctor
+```
+
+如 1Password 条目有多个隐藏字段，可用 `-OnePasswordField <字段名或字段 ID>` 精确选择；
+如需主动轮换媒体桥令牌，重新导入时加 `-RotateMediaToken`。DPAPI 密文仅能由这台 Windows 上的
+当前用户解开，迁移到另一台机器时需要重新从 1Password 导入。
+
 `scripts/local_media_bridge.py` 提供 MiniMax 原生生图、视频到 Easel 兼容接口的转换：
 
 ```sh
