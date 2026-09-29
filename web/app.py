@@ -431,6 +431,7 @@ async def _lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await content_workflow_service.shutdown()
         await minimax_service.stop()
         _stop_mp_login_on_shutdown()
 
@@ -439,6 +440,10 @@ app = FastAPI(title="Easel", docs_url=None, redoc_url=None, lifespan=_lifespan)
 from easel.minimax_quota import QuotaService, router as minimax_router
 minimax_service = QuotaService(PROJECT_ROOT)
 app.include_router(minimax_router(minimax_service))
+from easel.content_workflow import ContentWorkflowService
+from easel.content_workflow_api import router as content_workflow_router
+content_workflow_service = ContentWorkflowService(PROJECT_ROOT)
+app.include_router(content_workflow_router(content_workflow_service))
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 

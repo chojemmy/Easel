@@ -1,0 +1,12 @@
+{
+  "name": "easel-workflow-video",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@remotion/cli": "4.0.503",
+    "@remotion/media": "4.0.503",
+    "remotion": "4.0.503",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  }
+}

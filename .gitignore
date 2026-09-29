@@ -44,6 +44,8 @@ assets/**/*
 !assets/music-library/library.json
 !assets/readme/
 !assets/readme/**
+!assets/workflow-template/
+!assets/workflow-template/**
 
 # Session files
 *.jsonl
