@@ -1,6 +1,6 @@
 import type { Page } from './Sidebar';
 import type { ComponentType } from 'react';
-import { IconDashboard, IconFire, IconIdea, IconCalendar, IconPublish, IconSkills } from './icons';
+import { IconDashboard, IconFire, IconIdea, IconCalendar, IconPublish, IconSkills, IconLayers } from './icons';
 
 interface SubNavProps {
   current: Page;
@@ -8,6 +8,7 @@ interface SubNavProps {
 }
 
 const TOOLS: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }[] = [
+  { page: 'content-workflow', Icon: IconLayers, label: '内容工作流' },
   { page: 'trends', Icon: IconFire, label: '热点雷达' },
   { page: 'ideas', Icon: IconIdea, label: '选题库' },
   { page: 'calendar', Icon: IconCalendar, label: '内容日历' },

@@ -12,6 +12,7 @@ import CalendarPage from './components/CalendarPage';
 import IdeasPage from './components/IdeasPage';
 import PublishPage from './components/PublishPage';
 import BreakdownPage from './components/BreakdownPage';
+import ContentWorkflowPage from './components/ContentWorkflowPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
@@ -46,6 +47,8 @@ function onboardingSeen(): boolean {
 
 export default function App() {
   const [currentPage, setCurrentPage] = useState<Page>('dashboard');
+  const [workflowVisited, setWorkflowVisited] = useState(false);
+  useEffect(() => { if (currentPage === 'content-workflow') setWorkflowVisited(true); }, [currentPage]);
   const [personas, setPersonas] = useState<PersonaItem[]>([]);
   const [selectedPersona, setSelectedPersona] = useState('');
   const [sessions, setSessions] = useState<ChatSession[]>(() => loadSessions());
@@ -700,6 +703,8 @@ export default function App() {
             }}
           />
         ) : null;
+      case 'content-workflow':
+        return null;
       case 'trends':
         return <TrendsPage onUseTopic={handleUseTopic} />;
       case 'ideas':
@@ -769,6 +774,11 @@ export default function App() {
           <SubNav current={currentPage} onNavigate={setCurrentPage} />
         )}
         <div className="page-host">
+          {(workflowVisited || currentPage === 'content-workflow') && (
+            <div style={{ display: currentPage === 'content-workflow' ? 'contents' : 'none' }}>
+              <ContentWorkflowPage />
+            </div>
+          )}
           {renderPage()}
         </div>
       </main>
