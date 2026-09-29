@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,14 @@ import login_state  # noqa: E402
 import content_guard  # noqa: E402  出站内容安全闸门
 import platform_readback  # noqa: E402  发布读回对账（快手已接入，注册表见 _READBACK_VERIFIERS）
 import human_pace  # noqa: E402  人类节奏（提交前双停顿；EASEL_PACE_SKIP=1 跳过）
+
+
+def _best_effort_print(message: str, *, file=None) -> None:
+    """日志输出不得改变登录/发布的真实结果。"""
+    try:
+        print(message, file=file)
+    except (OSError, UnicodeError):
+        pass
 
 # ── 平台配置注册表 ────────────────────────────────────────────────────
 # 每个步骤：{"action": goto|upload|fill|click|wait|press|waitfor, "selector"?, "value"?}
@@ -217,13 +226,9 @@ PLATFORMS: dict[str, dict] = {
         ],
         # 发布成功校验：成功后离开创作页（/platform/post/create → 作品列表）——避免"点了发表=成功"假阳性
         "publish_success": {"url_not_contains": "post/create", "selector": "text=发表成功"},
-        "selector_caveat": "视频号需微信扫码登录，二维码在跨域 iframe（open.weixin.qq.com/connect/qrconnect）内，"
-                           "已配 login_qr_iframe 直接截 iframe 元素本体（真机 2026-08 验证有效）。"
-                           "登录判定/whoami 已真机校准（login_check=finder-nickname/唯一ID/桌面导航；昵称 .finder-nickname、头像 img.avatar）。"
-                           "发布走专用函数 _publish_weixin_channels（真机 2026-08 打通）：goto /platform/post/list 点『发表视频』进创作页"
-                           "（直接 goto create 会重定向回首页）→ 上传 → 等转码出创作器（在 OOPIF iframe /micro/content/post/create 内，"
-                           "Playwright locator 解析不到、合成点击不被信任）→ evaluate 填描述(div.input-editor,execCommand) + 聚焦发表按钮 "
-                           "→ page.keyboard 按 Enter 可信提交，URL 跳 /post/list 即成功。下方 steps 已弃用（占位）。",
+        "selector_caveat": "视频号需微信扫码登录。2026-09 实测后台为 Wujie 微前端：URL/frame 出现不等于子应用已挂载，"
+                           "必须等真实『发表视频』入口和 input[type=file]。专用流程支持互斥的『保存草稿』/『发表』；"
+                           "草稿只有在草稿箱按标题回读到唯一内容后才报成功。下方 steps 仅为配置占位，实际执行走专用函数。",
     },
     "zhihu": {
         "name": "知乎",
@@ -314,6 +319,18 @@ def cmd_plan(a) -> int:
     print(f"平台：{cfg['name']}（{a.platform}）")
     print(f"登录页：{cfg['login_url']}")
     print(f"⚠️ 选择器提示：{cfg['selector_caveat']}\n")
+    if a.platform == "weixin-channels":
+        target = "保存草稿" if getattr(a, "draft", False) else "公开发表"
+        print(f"目标：{target}（dry-run）")
+        print("  1. 打开视频管理并等待真实『发表视频』入口（最多 3 轮有限恢复）")
+        print("  2. 进入创作页并等待真实 input[type=file] 后上传一次")
+        print("  3. 等上传/转码完成，填写并回读视频描述和短标题")
+        if getattr(a, "draft", False):
+            print("  4. 精确点击一次『保存草稿』（绝不点击『发表』）")
+            print("  5. 打开平台草稿箱，按标题回读到条目才算成功")
+        else:
+            print("  4. 精确触发一次『发表』；结果未知时停止，不自动重发")
+        return 0
     print("发布步骤（dry-run）：")
     for i, s in enumerate(steps, 1):
         detail = s.get("selector", "")
@@ -380,113 +397,312 @@ def _fill_first_visible(page, sel: str, val: str) -> None:
         el.fill(val)
 
 
-def _publish_weixin_channels(page, ctx: dict) -> None:
-    """视频号发布专用流程（与通用 steps 不同，真机 2026-08 校准）：
-    - 直接 goto /platform/post/create 会被重定向回首页 → 必须 SPA 导航（首页→内容管理→发表视频）。
-    - 创作器在同源 iframe /micro/content/post/create：描述框 div.input-editor、发表按钮
-      button.weui-desktop-btn_primary 都在该 frame 内，主页面选择器够不到。"""
+_WEIXIN_LIST_URL = "https://channels.weixin.qq.com/platform/post/list"
+_WEIXIN_DRAFT_LIST_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
+
+
+def _weixin_visible_exact_text(page, text: str):
+    """返回视频号微前端里第一个可见的精确文本节点。
+
+    视频号当前用 Wujie 微前端：同一份 UI 有时表现为 iframe，有时挂在
+    wujie-app 的开放 shadow root。Playwright 的 page locator 能穿透后者，
+    因而这里不再把 /micro/content/... frame URL 当作“界面已就绪”的证据。
+    """
+    loc = page.get_by_text(text, exact=True)
+    for i in range(min(loc.count(), 20)):
+        try:
+            el = loc.nth(i)
+            if el.is_visible():
+                return el
+        except Exception:
+            pass
+    return None
+
+
+def _weixin_exact_button(page, text: str):
+    """找精确按钮；只接受 button role，避免把侧栏/说明文字当提交控件。"""
+    loc = page.get_by_role("button", name=text, exact=True)
+    for i in range(min(loc.count(), 12)):
+        try:
+            el = loc.nth(i)
+            if el.is_visible():
+                return el
+        except Exception:
+            pass
+    # 某些版本没有可访问性 role，但仍是原生 button。
+    loc = page.locator("button")
+    for i in range(min(loc.count(), 120)):
+        try:
+            el = loc.nth(i)
+            if el.is_visible() and (el.inner_text() or "").strip() == text:
+                return el
+        except Exception:
+            pass
+    return None
+
+
+def _weixin_wait_create_ready(page, cfg: dict, *, attempts: int = 3):
+    """从视频管理页进入创作页，并以真实上传 input 判定微前端已挂载。
+
+    URL/iframe 出现不代表 Wujie 子应用已渲染。每轮都只重试“无副作用的页面
+    导航”；一旦开始上传，本函数不会再被调用，防止重复上传/提交。
+    """
+    last = ""
+    for attempt in range(1, attempts + 1):
+        print(f"  视频号：加载视频管理（{attempt}/{attempts}）…", file=sys.stderr)
+        try:
+            page.goto(_WEIXIN_LIST_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            last = f"视频管理页导航失败：{e}"
+        try:
+            _settle_login(page, cfg)
+        except Exception:
+            pass
+        if not _is_logged_in(page, cfg):
+            raise RuntimeError("视频号未登录，请先在账号页扫码登录")
+
+        deadline = time.time() + 60
+        entry = None
+        while time.time() < deadline:
+            entry = _weixin_visible_exact_text(page, "发表视频")
+            if entry is not None:
+                break
+            page.wait_for_timeout(1000)
+        if entry is None:
+            last = "视频管理微前端未挂载（未出现『发表视频』）"
+            if attempt < attempts:
+                page.wait_for_timeout(2000 * attempt)
+            continue
+
+        try:
+            entry.click(timeout=15000)
+        except Exception as e:
+            last = f"『发表视频』入口点击失败：{e}"
+            if attempt < attempts:
+                page.wait_for_timeout(2000 * attempt)
+            continue
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                files = page.locator("input[type=file]")
+                if files.count() and "/post/create" in (page.url or ""):
+                    return files.first
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+        last = ("已进入创作路由，但真实上传控件未出现；"
+                "这是视频号微前端半加载状态，不应继续上传")
+        if attempt < attempts:
+            page.wait_for_timeout(2000 * attempt)
+    raise RuntimeError(f"视频号创作器未就绪：{last}")
+
+
+def _weixin_editor_and_button(page, button_text: str):
+    """每次重取 locator，兼容上传/转码期间 Wujie 子应用重挂载。"""
+    editor = page.locator("div.input-editor")
+    visible_editor = None
+    for i in range(min(editor.count(), 8)):
+        try:
+            if editor.nth(i).is_visible():
+                visible_editor = editor.nth(i)
+                break
+        except Exception:
+            pass
+    return visible_editor, _weixin_exact_button(page, button_text)
+
+
+_WEIXIN_SHORT_TITLE_PUNCT = set("《》〈〉“”‘’\"':：+＋?？%％℃°")
+
+
+def _weixin_short_title(title: str) -> str:
+    """按视频号短标题控件的实测规则替换不支持的标点。
+
+    页面明确提示仅支持书名号、引号、冒号、加号、问号、百分号和摄氏度；
+    其余符号（实测包括中文逗号）用单个空格替代。原始标题仍完整写入视频描述。
+    """
+    out = []
+    for ch in (title or "").strip():
+        if ch.isalnum() or ch in _WEIXIN_SHORT_TITLE_PUNCT:
+            out.append(ch)
+        else:
+            out.append(" ")
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _weixin_fill_composer(page, ctx: dict, editor) -> None:
+    desc = "\n".join(x for x in (ctx.get("title"), ctx.get("desc"), ctx.get("tags")) if x)
+    if desc:
+        try:
+            editor.fill(desc)
+        except Exception:
+            editor.click()
+            page.keyboard.press("Control+A")
+            page.keyboard.insert_text(desc)
+        page.wait_for_timeout(800)
+        actual = (editor.inner_text() or "").strip()
+        title = (ctx.get("title") or "").strip()
+        if title and title not in actual:
+            raise RuntimeError("视频描述回读不一致，保存前已停止")
+
+    # “短标题”是独立字段；能找到时填写并回读，找不到不阻断（平台仍允许只填描述）。
+    title = (ctx.get("title") or "").strip()
+    short_title = _weixin_short_title(title)
+    if short_title:
+        if short_title != title:
+            print(f"  视频号：短标题已按平台规则规范化为『{short_title}』", file=sys.stderr)
+        for sel in ("input[placeholder*='短标题']", "input[placeholder*='更多流量']"):
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 6)):
+                try:
+                    el = loc.nth(i)
+                    if not el.is_visible():
+                        continue
+                    el.fill(short_title)
+                    if (el.input_value() or "").strip() != short_title:
+                        raise RuntimeError("短标题回读不一致，保存前已停止")
+                    return
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+
+def _weixin_draft_readback(page, title: str, *, attempts: int = 3) -> tuple[bool, str]:
+    """在独立标签页回读平台草稿箱；只凭 toast/URL 不算成功。"""
+    probe = page.context.new_page()
+    last = "草稿列表未出现目标标题"
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                probe.goto(_WEIXIN_DRAFT_LIST_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                last = f"草稿页导航失败：{e}"
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                try:
+                    hits = probe.get_by_text(title, exact=False)
+                    for i in range(min(hits.count(), 20)):
+                        if hits.nth(i).is_visible():
+                            out = Path(__file__).resolve().parents[3] / "outputs" / "_login" / \
+                                  "weixin-channels-draft-saved.png"
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            probe.screenshot(path=str(out))
+                            return True, f"草稿箱已找到『{title}』；截图：{out}"
+                except Exception as e:
+                    last = f"草稿列表读取异常：{e}"
+                page.wait_for_timeout(1500)
+            if attempt < attempts:
+                page.wait_for_timeout(3000 * attempt)
+        try:
+            out = Path(__file__).resolve().parents[3] / "outputs" / "_login" / \
+                  "weixin-channels-draft-unverified.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            probe.screenshot(path=str(out))
+            last += f"；现场截图：{out}"
+        except Exception:
+            pass
+        return False, last
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+
+
+def _publish_weixin_channels(page, ctx: dict, *, save_draft: bool = False) -> str:
+    """视频号专用流程；返回 draft_saved 或 published。
+
+    2026-09 实测：后台是 Wujie 微前端。必须用真实控件就绪而非 URL/iframe
+    判定；保存草稿与公开发表互斥，任一提交动作一旦发出都禁止自动再点。
+    """
     media = ctx.get("media")
     if not media:
         raise RuntimeError("视频号发布需要视频文件（--media）")
     cfg = PLATFORMS["weixin-channels"]
-    # 1) 进创作页：goto 列表页（会回跳首页但 SPA 会渲染「发表视频」入口）→ 点它进 create
-    page.goto("https://channels.weixin.qq.com/platform/post/list", wait_until="domcontentloaded")
-    _settle_login(page, cfg)
-    if not _is_logged_in(page, cfg):
-        raise RuntimeError("视频号未登录，请先在账号页扫码登录")
-    page.wait_for_timeout(3000)
-    page.wait_for_selector("text=发表视频", timeout=15000)
-    # 点第一个「可见」的发表视频（避开同名但不可见的帮助文字 <p>，那会导致点击超时）
-    loc = page.locator("text=发表视频")
-    clicked = False
-    for i in range(min(loc.count(), 8)):
+    # 1) 进入真正就绪的创作器。这里只允许对无副作用的导航做有限恢复。
+    file_input = _weixin_wait_create_ready(page, cfg)
+    # 2) 上传只做一次；从这里起失败不再自动重走整条流程。
+    print("  视频号：上传视频…", file=sys.stderr)
+    file_input.set_input_files(media, timeout=90000)
+
+    target_text = "保存草稿" if save_draft else "发表"
+    print(f"  视频号：等上传/转码完成 + 『{target_text}』可用…", file=sys.stderr)
+    deadline = time.time() + 600
+    editor = button = None
+    last_err = "创作表单尚未就绪"
+    while time.time() < deadline:
         try:
-            el = loc.nth(i)
-            if el.is_visible():
-                el.click()
-                clicked = True
-                break
+            editor, button = _weixin_editor_and_button(page, target_text)
+            if editor is not None and button is not None:
+                if button.is_enabled():
+                    break
+                last_err = f"『{target_text}』仍为 disabled（视频尚在上传/处理）"
+        except Exception as e:
+            last_err = str(e)
+        try:
+            err = page.get_by_text(re.compile("上传失败|处理失败|网络异常"))
+            for i in range(min(err.count(), 10)):
+                if err.nth(i).is_visible():
+                    raise RuntimeError((err.nth(i).inner_text() or "视频上传失败").strip())
+        except RuntimeError:
+            raise
         except Exception:
             pass
-    if not clicked:
-        raise RuntimeError("找不到可点的『发表视频』按钮")
-    page.wait_for_url("**/post/create", timeout=15000)
-    # 2) 上传视频：先等上传 input 就绪再塞（否则塞到未就绪的 input，转码不触发 → 创作器不出现）
-    print("  视频号：上传视频…", file=sys.stderr)
-    page.wait_for_timeout(5000)
-    page.wait_for_selector("input[type=file]", state="attached", timeout=30000)
-    page.set_input_files("input[type=file]", media, timeout=30000)
-    # 3-5) 等创作器就绪并发表。真机踩坑：转码完成时 composer iframe（/micro/content/post/create，
-    #      嵌套在另一 iframe 内 → frame_locator 的 iframe[src] 解析不到）会重载，持有的 frame 句柄立即失效
-    #      （evaluate 刚确认元素存在、下一步 locator 就报找不到）。故每轮从 page.frames 重取最新 frame，
-    #      同一轮内立即填描述+发表；若中途 frame 重载报错，等一下换新 frame 重试。填描述先 Ctrl+A 清空保证幂等。
-    print("  视频号：等转码 + 创作表单…", file=sys.stderr)
-    desc = "\n".join(x for x in (ctx.get("title"), ctx.get("desc"), ctx.get("tags")) if x)
-    deadline = time.time() + 300
-    published = False
-    last_err = None
-    while time.time() < deadline and not published:
-        fr = next((f for f in page.frames if "micro/content/post/create" in (f.url or "")), None)
-        if fr is None:
-            page.wait_for_timeout(3000)
-            continue
+        page.wait_for_timeout(3000)
+    if editor is None or button is None or not button.is_enabled():
+        raise RuntimeError(f"视频号创作器未达到可提交状态：{last_err}")
+
+    _weixin_fill_composer(page, ctx, editor)
+    try:
+        out = Path(__file__).resolve().parents[3] / "outputs" / "_login" / \
+              ("weixin-channels-draft-prefill.png" if save_draft else "weixin-channels-publish-prefill.png")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(out))
+    except Exception:
+        pass
+
+    human_pace.pause_before_commit(
+        len(str(ctx.get("title") or "")) + len(str(ctx.get("desc") or "")))
+    if save_draft:
+        # 草稿与发表严格互斥：只对精确的“保存草稿”按钮发一次可信 click。
+        print("  视频号：单次点击『保存草稿』…", file=sys.stderr)
         try:
-            ready = fr.evaluate("() => !!document.querySelector('div.input-editor') && "
-                                "[...document.querySelectorAll('button')].some(b => (b.innerText||'').trim() === '发表')")
-        except Exception:
-            page.wait_for_timeout(3000)   # frame 正在重载
-            continue
-        if not ready:
-            page.wait_for_timeout(3000)
-            continue
-        try:
-            if desc:
-                fr.evaluate("""(t) => {
-                    const ed = document.querySelector('div.input-editor');
-                    if (ed) {
-                        ed.focus();
-                        document.execCommand('selectAll', false, null);
-                        document.execCommand('insertText', false, t);
-                    }
-                }""", desc)
-                page.wait_for_timeout(1200)
-            # 真机 2026-08 验证的可靠提交法：该 composer 是 OOPIF——Playwright locator 解析不到、
-            # evaluate 合成点击不被视频号信任（校验 isTrusted）。故 evaluate 聚焦发表按钮 →
-            # page.keyboard 按 Enter（CDP 系统级注入的可信键盘事件，路由到聚焦元素触发真实提交）。
-            # 成功标志：约 6s 后 URL 从 /post/create 跳到 /post/list。切勿在 Enter 后再点其它「确认」按钮（会打断提交）。
-            print("  视频号：聚焦发表并按 Enter…", file=sys.stderr)
-            status = fr.evaluate("""() => {
-                const b = [...document.querySelectorAll('button')].find(x => (x.innerText||'').trim() === '发表');
-                if (!b) return 'no-btn';
-                if (b.disabled || b.getAttribute('disabled') !== null) return 'disabled';
-                b.scrollIntoView({block: 'center'});
-                b.focus();
-                return document.activeElement === b ? 'focused' : 'not-focused';
-            }""")
-            print(f"  视频号：发表按钮状态={status}", file=sys.stderr)
-            if status == 'disabled':
-                last_err = "发表按钮 disabled（视频可能还在处理）"
-                page.wait_for_timeout(5000)
-                continue
-            if status == 'no-btn':
-                last_err = "未找到发表按钮"
-                page.wait_for_timeout(3000)
-                continue
-            page.keyboard.press("Enter")   # 可信提交
-            # 等 URL 离开创作页 = 提交成功（真机 ~6s 跳 /post/list）
-            for _ in range(12):
-                page.wait_for_timeout(2000)
-                if "post/create" not in (page.url or "").lower():
-                    published = True
-                    break
-            if not published:
-                last_err = "发表后未跳转（可能未提交），换新 frame 重试"
+            button.click(timeout=15000)
         except Exception as e:
-            last_err = e
-            page.wait_for_timeout(3000)   # 多半是 frame 刚重载，换新 frame 重试
+            raise RuntimeError(f"保存草稿动作已尝试一次，结果未知；未自动重试：{e}") from e
+        page.wait_for_timeout(8000)
+        ok, evidence = _weixin_draft_readback(page, (ctx.get("title") or "").strip())
+        if not ok:
+            raise RuntimeError(f"保存草稿结果未确认（已遵守单次提交，未自动重试）：{evidence}")
+        print(f"  视频号：{evidence}", file=sys.stderr)
+        return "draft_saved"
+
+    # 公开发表仍遵守单次提交；只聚焦精确“发表”按钮并注入一次可信 Enter。
+    published = False
+    submit_attempted = False
+    try:
+        print("  视频号：聚焦发表并按 Enter…", file=sys.stderr)
+        button.focus()
+        submit_attempted = True
+        page.keyboard.press("Enter")
+        for _ in range(30):
+            page.wait_for_timeout(2000)
+            if "post/create" not in (page.url or "").lower():
+                published = True
+                break
+        if not published:
+            last_err = ("已触发一次发表，但 60s 内页面未跳转，结果未知；"
+                        "为防重复投稿未再次提交，请到作品管理页核对")
+    except Exception as e:
+        last_err = (f"提交后页面校验异常，结果未知；为防重复投稿未再次提交：{e}"
+                    if submit_attempted else e)
     if not published:
-        raise RuntimeError(f"视频号发表未成功（创作器反复重载或选择器失效）：{last_err}")
+        if submit_attempted:
+            raise RuntimeError(f"视频号发表结果未确认（已遵守单次提交，未自动重发）：{last_err}")
+        raise RuntimeError(f"视频号发表未成功（提交前创作器反复重载或选择器失效）：{last_err}")
     page.wait_for_timeout(3000)
+    return "published"
 
 
 # ── 发布读回对账（platform_readback）──────────────────────────────────
@@ -611,9 +827,11 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
         submitted_at_ms: int | None = None   # 「提交动作」时间戳（commit 标记步记录，读回时间窗基准）
         flow_started_ms = int(time.time() * 1000)
         try:
+            weixin_outcome = None
             if a.platform == "weixin-channels":
-                # 视频号走专用流程（SPA 导航 + iframe 创作器），通用 steps 不适用 → 跳过
-                _publish_weixin_channels(page, ctx)
+                # 视频号走专用流程（SPA 导航 + Wujie 微前端），通用 steps 不适用 → 跳过
+                weixin_outcome = _publish_weixin_channels(
+                    page, ctx, save_draft=bool(getattr(a, "draft", False)))
                 steps = []
             for i, s in enumerate(steps, 1):
                 act = s["action"]
@@ -721,6 +939,9 @@ def _run_browser(a, headed: bool, do_publish: bool) -> int:
                         print(f"    (可选步骤跳过：{e})", file=sys.stderr)
                         continue
                     raise
+            if weixin_outcome == "draft_saved":
+                print(f"✅ {cfg['name']}草稿保存成功（草稿箱标题回读已确认）")
+                return 0
             # 发布结果校验（界面层，旁证）：配置了 publish_success 才验；未配的平台沿用"跑完即报"
             chk = cfg.get("publish_success")
             ui_ok = False
@@ -1135,7 +1356,7 @@ def cmd_login_qr(a) -> int:
                 page.wait_for_timeout(1200)
             if _is_logged_in(page, cfg):
                 login_state.write_status(sf, "success", "已登录")
-                print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
+                _best_effort_print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
                 return 0
 
             # 登录预备步骤（如快手：点『立即登录』跳 passport 再切『扫码登录』才出二维码）
@@ -1179,7 +1400,7 @@ def cmd_login_qr(a) -> int:
                 page.wait_for_timeout(_LOGIN_POLL_MS)
             if confirmed:
                 login_state.write_status(sf, "success", "登录成功")
-                print(f"✅ {cfg['name']} 登录成功，登录态已持久化")
+                _best_effort_print(f"✅ {cfg['name']} 登录成功，登录态已持久化")
                 try:
                     qr_out.unlink()
                 except OSError:
@@ -1203,6 +1424,10 @@ def cmd_publish(a) -> int:
         _die(f"媒体文件不存在：{a.media}")
     # 媒体类型校验：视频流程平台给图片会晦涩超时；但若平台有图文流程（steps_image）则放行走图文
     cfg = PLATFORMS.get(a.platform, {})
+    if getattr(a, "draft", False) and a.platform != "weixin-channels":
+        _die("--draft 当前只支持微信视频号平台草稿箱", 7)
+    if getattr(a, "draft", False) and not (a.title or "").strip():
+        _die("视频号平台草稿必须提供 --title，供草稿箱唯一回读核验", 7)
     if cfg.get("media_kind") == "video" and a.media and not cfg.get("steps_image"):
         ext = Path(a.media).suffix.lower()
         if ext not in VIDEO_EXTS:
@@ -1210,17 +1435,22 @@ def cmd_publish(a) -> int:
                  f"当前选的是 {ext or '无扩展名'} 文件（{Path(a.media).name}）。"
                  f"请改选视频文件；图文（发图片）发布暂未支持。", 7)
     if not a.exec:
-        print("dry-run（加 --exec 真正发布）：")
+        action = "保存平台草稿" if getattr(a, "draft", False) else "发布"
+        print(f"dry-run（加 --exec 真正{action}）：")
         content_guard.guard_or_die([a.title, a.desc, a.tags], exec_mode=False,
                                    allow_unsafe=getattr(a, "allow_unsafe", False),
-                                   label=f"{cfg.get('name', a.platform)}发布内容")
+                                   label=f"{cfg.get('name', a.platform)}{action}内容")
         return cmd_plan(a)
     # 出站内容安全闸门：真发前扫描标题/正文/话题，检出内部设置泄露即阻止发布。
     content_guard.guard_or_die([a.title, a.desc, a.tags], exec_mode=True,
                                allow_unsafe=getattr(a, "allow_unsafe", False),
                                label=f"{cfg.get('name', a.platform)}发布内容")
-    rc = _run_browser(a, headed=a.headed, do_publish=True)
-    if rc == 0:
+    headed = a.headed
+    if a.platform == "weixin-channels" and not headed:
+        print("  视频号：自动启用有头模式（实测 headless 微前端可能空白）", file=sys.stderr)
+        headed = True
+    rc = _run_browser(a, headed=headed, do_publish=True)
+    if rc == 0 and not getattr(a, "draft", False):
         # 发布成功 → 落统一内容日历（对话页自动；发布页 web 设 AUTORECORD=0 跳过防重复）
         try:
             import calendar_ops
@@ -1440,6 +1670,8 @@ def main() -> int:
 
     p = sub.add_parser("plan", help="发布步骤预览（dry-run）")
     add_common(p)
+    p.add_argument("--draft", action="store_true",
+                   help="仅微信视频号：预览保存到平台草稿箱的流程")
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("login", help="有头浏览器登录并持久化")
@@ -1459,6 +1691,8 @@ def main() -> int:
     p.add_argument("--allow-unsafe", action="store_true",
                    help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
     p.add_argument("--headed", action="store_true", help="有头模式执行（便于观察/首次校验）")
+    p.add_argument("--draft", action="store_true",
+                   help="仅微信视频号：保存到平台草稿箱，不公开发表；以草稿箱回读为成功条件")
     p.add_argument("--keep-open", action="store_true", help="发布后不关闭浏览器")
     p.set_defaults(func=cmd_publish)
 
