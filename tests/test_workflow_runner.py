@@ -45,7 +45,7 @@ def test_script_generate_appends_without_rewriting_source(case, monkeypatch):
         return "依据意见生成的新稿"
     monkeypatch.setattr(module,"generate",model)
     result = execute(case,"script",mode="generate")
-    assert systems == ["测试节点规范"]
+    assert len(systems)==1 and "测试节点规范" in systems[0] and "没有工具" in systems[0]
     assert len(result["manuscripts"]) == 2
     assert result["manuscripts"][0]["content"] == "用户自己的稿件"
     assert result["manuscripts"][1]["content"] == "依据意见生成的新稿"
@@ -163,6 +163,57 @@ def test_visual_props_cannot_inject_css_or_commands():
         validate_visual({**props,"background":"url(https://example.com)"},"documentary")
     with pytest.raises(RunnerBlocked):
         validate_visual({**props,"command":"curl"},"documentary")
+
+
+def test_caption_display_wrap_never_changes_words_or_timing():
+    text="字幕显示只做视觉换行而不改变原本真实的时间戳也绝对不能为了双行去丢掉最后几个文字"
+    source=[{"text":text,"startMs":1234,"endMs":6789,"timestampMs":None,"confidence":None}]
+    displayed,long_indices=module.display_captions(source)
+    assert long_indices==[0]
+    assert all(len(line)<=18 for line in displayed[0]['text'].split('\n'))
+    assert displayed[0]['text'].replace('\n','')==text
+    assert displayed[0]['startMs']==1234 and displayed[0]['endMs']==6789
+    assert source[0]['text']==text
+
+
+def test_build_explicit_and_builtin_defaults_skip_model(case,monkeypatch):
+    async def no_model(*args,**kwargs):pytest.fail("Explicit and built-in visual parameters need no model")
+    monkeypatch.setattr(module,"generate",no_model)
+    root,directory,project=case
+    explicit={"background":"#102020","accent":"#DDAA33","textColor":"#FFFFFF","subtitleSize":54,"cardPosition":"left","titleCase":"bold"}
+    runner=module._Run(WorkflowRunner(root),project,"build",{}, {"source":"builtin","personalized":False,"content":"完整内置规则"},directory,lambda _:None)
+    visual,origin=asyncio.run(runner.visual_parameters({"visual_parameters":explicit},"documentary"))
+    assert origin=="explicit" and visual['subtitleSize']==54
+    visual,origin=asyncio.run(runner.visual_parameters({"visual_style":"克制科技纪录片","subtitle_style":"清晰双行"},"documentary"))
+    assert origin=="default" and visual['subtitleSize']==48
+
+
+def test_build_feedback_uses_explicit_parameters_as_baseline_not_override(case,monkeypatch):
+    explicit={"background":"#102020","accent":"#DDAA33","textColor":"#FFFFFF","subtitleSize":54,"cardPosition":"left","titleCase":"bold"}
+    async def model(prompt,*,system,task):
+        assert task=="short_json"
+        assert "#DDAA33" in prompt and "修改前参考基线" in prompt and "强调色改为红色" in prompt
+        return {**explicit,"accent":"#CC3333"}
+    monkeypatch.setattr(module,"generate",model)
+    root,directory,project=case
+    runner=module._Run(WorkflowRunner(root),project,"build",{"feedback":"强调色改为红色"},{"source":"builtin","personalized":False,"content":"保留未要求改变的视觉属性"},directory,lambda _:None)
+    visual,origin=asyncio.run(runner.visual_parameters({"visual_parameters":explicit},"documentary"))
+    assert origin=="model" and visual["accent"]=="#CC3333"
+    assert explicit["accent"]=="#DDAA33"
+
+
+@pytest.mark.parametrize("personal,feedback,style",[(True,None,"克制科技纪录片"),(False,"字体再大些","克制科技纪录片"),(False,None,"米白色杂志风")])
+def test_build_custom_preferences_use_short_json_model(case,monkeypatch,personal,feedback,style):
+    calls=[]
+    async def model(prompt,*,system,task):
+        calls.append((prompt,system,task))
+        return {"background":"#102020","accent":"#DDAA33","textColor":"#FFFFFF","subtitleSize":54,"cardPosition":"left","titleCase":"bold"}
+    monkeypatch.setattr(module,"generate",model)
+    root,directory,project=case
+    runner=module._Run(WorkflowRunner(root),project,"build",{"feedback":feedback}, {"source":"personal" if personal else "builtin","personalized":personal,"content":"完整节点Skill"},directory,lambda _:None)
+    _,origin=asyncio.run(runner.visual_parameters({"visual_style":style,"subtitle_style":"清晰双行"},"documentary"))
+    assert origin=="model" and calls[0][2]=="short_json"
+    assert "完整节点Skill" in calls[0][1] and "没有工具" in calls[0][1]
 
 
 def test_missing_asr_blocks_without_spawning_download(case,monkeypatch):

@@ -39,6 +39,14 @@ class _Settings:
     key: str = field(repr=False)
 
 
+@dataclass(frozen=True)
+class _RequestBudget:
+    max_tokens: int
+    timeout: float
+    effort: str | None
+    disable_thinking: bool = False
+
+
 def _env_value(name: str, seen: set[str] | None = None) -> str:
     """Resolve plain environment references only; no files, shell or eval."""
     visited = set() if seen is None else set(seen)
@@ -183,6 +191,34 @@ class WorkflowModel:
         return {"provider": settings.provider, "model": settings.model,
                 "base_url": settings.base_url, "api": settings.api}
 
+    def _budget(self, settings: _Settings, task: str, max_tokens: int | None,
+                effort: str | None) -> _RequestBudget:
+        if task not in {"default", "script", "short_json"}:
+            raise ValueError("未知模型任务预算；可选 default、script 或 short_json。")
+        if max_tokens is None:
+            max_tokens = 2048 if task == "short_json" else 8192
+        if type(max_tokens) is not int or not 256 <= max_tokens <= 32768:
+            raise ValueError("本工作流生成预算须为 256 到 32768 之间的整数。")
+        if effort is not None and effort not in {"low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("思考档位仅接受 low、medium、high、xhigh 或 max；不支持 none。")
+        # MiniMax's official contract, checked 2026-09-29:
+        # https://platform.minimax.cn/docs/api-reference/text-anthropic-api
+        # https://platform.minimax.cn/docs/api-reference/text-openai-api
+        # M3.1 defaults to max effort and cannot disable thinking. M3 can disable
+        # it; M2 cannot. Do not guess Claude budget_tokens or other providers'
+        # reasoning controls from their Anthropic/OpenAI-compatible wire format.
+        flash = settings.model == "MiniMax-M3.1-Flash-Preview"
+        if effort is not None and not flash:
+            raise WorkflowModelConfigError("当前已验证的思考档位仅适用于 MiniMax-M3.1-Flash-Preview。")
+        if task == "short_json" and flash and effort is None:
+            effort = "low"
+        return _RequestBudget(
+            max_tokens=max_tokens,
+            timeout=min(self.timeout, 60) if task == "short_json" else self.timeout,
+            effort=effort,
+            disable_thinking=task == "short_json" and settings.model == "MiniMax-M3",
+        )
+
     @staticmethod
     def _extract(payload: Any, settings: _Settings) -> str:
         if not isinstance(payload, dict) or payload.get("type") == "error" or payload.get("error"):
@@ -192,7 +228,7 @@ class WorkflowModel:
             raise WorkflowModelError("模型服务拒绝了本次生成，请检查额度和模型权限。")
         if settings.api == "anthropic-messages":
             if payload.get("stop_reason") == "max_tokens":
-                raise WorkflowModelError("模型输出被长度限制截断，请缩短本节点输入或产出要求。")
+                raise WorkflowModelError("模型生成达到长度上限（包含思考消耗），内容未完成；请调整本节点预算或简化要求。")
             blocks = payload.get("content", [])
             if not isinstance(blocks, list):
                 raise WorkflowModelError("模型返回的文本结构无效。")
@@ -225,19 +261,25 @@ class WorkflowModel:
         # to persisted node results, even though it was not part of the prompt.
         return text.replace(settings.key, "[redacted]")
 
-    async def _request(self, prompt: str, system: str, settings: _Settings) -> str:
+    async def _request(self, prompt: str, system: str, settings: _Settings, budget: _RequestBudget) -> str:
         headers = {"Content-Type": "application/json"}
-        payload: dict[str, Any] = {"model": settings.model, "max_tokens": 8192, "stream": False}
+        payload: dict[str, Any] = {"model": settings.model, "max_tokens": budget.max_tokens, "stream": False}
+        if budget.disable_thinking:
+            payload["thinking"] = {"type": "disabled"}
         if settings.api == "anthropic-messages":
+            if budget.effort is not None:
+                payload["output_config"] = {"effort": budget.effort}
             headers.update({"x-api-key": settings.key, "anthropic-version": "2023-06-01"})
             payload["messages"] = [{"role": "user", "content": prompt}]
             if system:
                 payload["system"] = system
         else:
+            if budget.effort is not None:
+                payload["reasoning_effort"] = budget.effort
             headers["Authorization"] = "Bearer " + settings.key
             payload["messages"] = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
         options: dict[str, Any] = {
-            "timeout": httpx.Timeout(self.timeout, connect=min(20, self.timeout)),
+            "timeout": httpx.Timeout(budget.timeout, connect=min(20, budget.timeout)),
             "follow_redirects": False,
         }
         proxy = _env_value("EASEL_WORKFLOW_PROXY") or _env_value("EASEL_PROXY")
@@ -261,8 +303,16 @@ class WorkflowModel:
             raise WorkflowModelError("模型连接失败，请检查本机网络和代理设置。") from None
         return self._extract(result, settings)
 
-    async def generate(self, prompt: str, system: str = "", cancel: asyncio.Event | None = None) -> str:
-        """Generate text once, respecting both cancellation and a total deadline."""
+    async def generate(self, prompt: str, system: str = "", cancel: asyncio.Event | None = None,
+                       *, task: str = "default", max_tokens: int | None = None,
+                       effort: str | None = None) -> str:
+        """Generate once; short_json bounds parameter extraction, not long scripts.
+
+        default/script keep the existing 8192-token, provider-default reasoning
+        behavior. short_json uses 2048 tokens and at most 60 seconds; for known
+        MiniMax models it uses the officially supported low-latency controls.
+        The caller still validates JSON. No automatic retry or model fallback.
+        """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("模型输入不能为空。")
         if not isinstance(system, str):
@@ -270,11 +320,12 @@ class WorkflowModel:
         if cancel is not None and cancel.is_set():
             raise asyncio.CancelledError
         settings = self._settings()
-        request = asyncio.create_task(self._request(prompt, system, settings))
+        budget = self._budget(settings, task, max_tokens, effort)
+        request = asyncio.create_task(self._request(prompt, system, settings, budget))
         stop = asyncio.create_task(cancel.wait()) if cancel is not None else None
         tasks = {request, stop} if stop is not None else {request}
         try:
-            done, _ = await asyncio.wait(tasks, timeout=self.timeout, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(tasks, timeout=budget.timeout, return_when=asyncio.FIRST_COMPLETED)
             if stop is not None and stop in done:
                 raise asyncio.CancelledError
             if request not in done:
@@ -287,5 +338,7 @@ class WorkflowModel:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def generate(prompt: str, system: str = "", cancel: asyncio.Event | None = None) -> str:
-    return await WorkflowModel().generate(prompt, system, cancel)
+async def generate(prompt: str, system: str = "", cancel: asyncio.Event | None = None,
+                   *, task: str = "default", max_tokens: int | None = None,
+                   effort: str | None = None) -> str:
+    return await WorkflowModel().generate(prompt, system, cancel, task=task, max_tokens=max_tokens, effort=effort)

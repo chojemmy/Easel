@@ -94,7 +94,7 @@ class ContentWorkflowService:
                             if node["id"] == "publish" and node.get("runs") and node["runs"][-1].get("action") in ("draft", "publish"):
                                 node.update(publication_uncertain=True, message="发布过程被服务重启中断，结果不明；请先到平台核实，不能自动重发。")
                             if node.get("runs"):
-                                node["runs"][-1].update(status="interrupted", finished_at=now())
+                                node["runs"][-1].update(status="interrupted", message=node["message"], finished_at=now())
                             changed = True
                     if changed:
                         write_json(file, project)
@@ -218,16 +218,22 @@ class ContentWorkflowService:
                     # A subtitle belongs to one recording. Do not silently carry it to another.
                     if "transcript_path" not in body["media"] or body["media"].get("transcript_path") == p["media"].get("transcript_path"):
                         value.pop("transcript_path", None)
-                    for generated in ("generated_transcript_path", "transcript_source_hash"):
+                    for generated in ("generated_transcript_path", "transcript_source_hash", "transcript_source_sha256"):
                         value.pop(generated, None)
                 if key == "settings":
                     changed = {k for k in value if value[k] != p[key].get(k)}
+                    if changed & {"visual_style", "subtitle_style"} and "visual_parameters" not in changed:
+                        # A form sends existing settings back; stale explicit props
+                        # must not silently override a newly entered style request.
+                        value.pop("visual_parameters", None)
                     if changed <= {"archive_folder", "media_root"}:
                         start = "archive"
                     elif all(k.startswith("publish_") for k in changed):
                         start = "publish"
                     elif changed <= {"final_path", "cover_path"}:
                         start = "deliver"
+                    elif changed <= {"output_ratio", "template", "visual_style", "subtitle_style", "visual_parameters"}:
+                        start = "build"
                 earliest = min(earliest, NODE_IDS.index(start))
                 p[key] = value
             mids = [m["id"] for m in p["manuscripts"]]
@@ -339,7 +345,7 @@ class ContentWorkflowService:
                          artifacts=result.get("artifacts", []))
                 if result.get("publication_uncertain"):
                     n["publication_uncertain"] = True
-                n["runs"][-1].update(status=n["status"], finished_at=now())
+                n["runs"][-1].update(status=n["status"], message=safe_error(n["message"]), finished_at=now())
                 if n["status"] in ("completed", "awaiting_review"):
                     for feedback in n["feedback"]:
                         if not feedback.get("applied_run_id"):
@@ -364,7 +370,7 @@ class ContentWorkflowService:
                 if node == "publish" and n["runs"][-1].get("action") in ("draft", "publish"):
                     n["publication_uncertain"] = True
                     n["message"] += " 提交结果需要到平台核实，已阻止自动重发。"
-                n["runs"][-1].update(status=status, finished_at=now())
+                n["runs"][-1].update(status=status, message=safe_error(n["message"]), finished_at=now())
                 self.save(p)
 
     def reconcile_not_submitted(self, project_id: str, note: str) -> dict:

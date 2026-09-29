@@ -46,7 +46,8 @@ function onboardingSeen(): boolean {
 }
 
 export default function App() {
-  const [currentPage, setCurrentPage] = useState<Page>('dashboard');
+  const [currentPage, setCurrentPage] = useState<Page>(() =>
+    new URLSearchParams(window.location.search).has('workflow') ? 'content-workflow' : 'dashboard');
   const [workflowVisited, setWorkflowVisited] = useState(false);
   useEffect(() => { if (currentPage === 'content-workflow') setWorkflowVisited(true); }, [currentPage]);
   const [personas, setPersonas] = useState<PersonaItem[]>([]);

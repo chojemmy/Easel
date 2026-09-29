@@ -7,7 +7,7 @@ export interface WorkflowFeedback { text: string; created_at?: string; at?: stri
 export interface WorkflowNode {
   id: WorkflowNodeId; title: string; status: string; message?: string; version: number;
   approved_version?: number; artifacts: WorkflowArtifact[]; runs: WorkflowRun[];
-  feedback: WorkflowFeedback[]; skill_version?: string; current_skill_version?: string; skill_updated?: boolean;
+  feedback: WorkflowFeedback[]; skill_version?: string; current_skill_version?: string; skill_updated?: boolean; skill_error?: string;
   publication_uncertain?: boolean; progress?: number; updated_at?: string;
 }
 export interface WorkflowManuscript {

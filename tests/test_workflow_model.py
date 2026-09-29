@@ -66,6 +66,80 @@ def test_current_model_direct_anthropic_text_only_request(config):
     assert "test-credential-not-real" not in repr(model._settings())
 
 
+@pytest.mark.parametrize("api,expected", [
+    ("anthropic-messages", {"output_config": {"effort": "low"}}),
+    ("openai-completions", {"reasoning_effort": "low"}),
+])
+def test_short_json_controls_flash_effort_without_changing_later_script(config, monkeypatch, api, expected):
+    monkeypatch.setenv("EASEL_WORKFLOW_MODEL", "minimax/MiniMax-M3.1-Flash-Preview")
+    monkeypatch.setenv("EASEL_WORKFLOW_API", api)
+    seen, client_options = [], []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "content": [{"type": "text", "text": "{}"}], "stop_reason": "end_turn",
+            "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+        })
+
+    def client_factory(**kwargs):
+        client_options.append(kwargs)
+        return factory(handler)(**kwargs)
+
+    model = WorkflowModel(config, client_factory=client_factory)
+    assert run(model, task="short_json") == "{}"
+    assert seen[0]["max_tokens"] == 2048
+    assert all(seen[0].get(key) == value for key, value in expected.items())
+    assert "thinking" not in seen[0]  # Flash rejects disabled thinking.
+    assert client_options[0]["timeout"].read == 60
+    assert run(model, task="script") == "{}"
+    assert seen[1]["max_tokens"] == 8192
+    assert not {"thinking", "output_config", "reasoning_effort"}.intersection(seen[1])
+    assert client_options[1]["timeout"].read == 240
+
+
+def test_explicit_budget_overrides_are_per_request(config, monkeypatch):
+    monkeypatch.setenv("EASEL_WORKFLOW_MODEL", "minimax/MiniMax-M3.1-Flash-Preview")
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "长稿"}]})
+
+    model = WorkflowModel(config, client_factory=factory(handler))
+    assert run(model, max_tokens=16384, effort="medium") == "长稿"
+    assert seen[0]["max_tokens"] == 16384
+    assert seen[0]["output_config"] == {"effort": "medium"}
+    assert run(model) == "长稿"
+    assert seen[1]["max_tokens"] == 8192 and "output_config" not in seen[1]
+
+
+@pytest.mark.parametrize("name,thinking", [("MiniMax-M3", {"type": "disabled"}), ("MiniMax-M2.7", None), ("other-model", None)])
+def test_short_json_only_disables_thinking_for_documented_m3(config, monkeypatch, name, thinking):
+    monkeypatch.setenv("EASEL_WORKFLOW_MODEL", "minimax/" + name)
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "{}"}]})
+
+    assert run(WorkflowModel(config, client_factory=factory(handler)), task="short_json") == "{}"
+    assert seen[0].get("thinking") == thinking
+    assert "output_config" not in seen[0] and "reasoning_effort" not in seen[0]
+
+
+@pytest.mark.parametrize("options", [
+    {"max_tokens": True}, {"max_tokens": 0}, {"max_tokens": 32769}, {"max_tokens": "2048"},
+    {"effort": "none"}, {"effort": "low"}, {"task": "unknown"},
+])
+def test_unsupported_or_invalid_budget_is_rejected_before_http(config, options):
+    def no_http(request):
+        pytest.fail("invalid budgets must not reach the provider")
+
+    with pytest.raises(ValueError):
+        run(WorkflowModel(config, client_factory=factory(no_http)), **options)
+
+
 def test_env_overrides_allow_openai_compatible_provider(config, monkeypatch):
     monkeypatch.setenv("EASEL_WORKFLOW_MODEL", "strong-model")
     monkeypatch.setenv("EASEL_WORKFLOW_BASE_URL", "https://model.example/v1")

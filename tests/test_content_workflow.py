@@ -58,6 +58,120 @@ def test_publish_copy_does_not_invalidate_render(service):
     assert node_of(updated, "publish")["status"] == "stale"
 
 
+@pytest.mark.parametrize("settings", [
+    {"visual_style": "米白编辑排版"},
+    {"output_ratio": "9:16"},
+    {"template": "editorial"},
+    {"subtitle_style": "字号更大、清晰留白"},
+    {"visual_parameters": {"background": "#FAF6EC", "accent": "#B64B32", "textColor": "#202020",
+                           "subtitleSize": 56, "cardPosition": "right", "titleCase": "bold"}},
+])
+def test_visual_changes_preserve_confirmed_storyboard_and_require_new_render_review(service, settings):
+    project = service.create({"title": "已确认分镜后换视觉"})
+    for node in project["nodes"]:
+        node.update(status="completed", version=3, approved_version=3)
+    storyboard = node_of(project, "storyboard")
+    storyboard["artifacts"] = [{"name": "已确认分镜", "path": "artifacts/storyboard.json"}]
+    storyboard["approved_at"] = "2026-09-29T00:00:00+00:00"
+    service.save(project)
+
+    updated = service.patch(project["id"], {"settings": settings, "content_version": project["content_version"]})
+
+    assert node_of(updated, "storyboard") == storyboard
+    assert all(node_of(updated, node)["status"] == "completed"
+               for node in ("brief", "script", "source", "transcript"))
+    for name in ("build", "review", "deliver", "publish", "archive"):
+        assert node_of(updated, name)["status"] == "stale"
+        assert "approved_version" not in node_of(updated, name)
+    # The user can rebuild immediately without redoing the approved timeline.
+    service.prerequisites(updated, "build")
+    with pytest.raises(WorkflowConflict):
+        service.prerequisites(updated, "deliver")
+
+
+@pytest.mark.parametrize("parameter_input", ["omitted", "echo_previous", "explicit_new"])
+def test_style_edit_replaces_stale_visual_parameters_and_keeps_explicit_new_choices(service, parameter_input):
+    previous = {"background": "#182020", "accent": "#D1B479", "textColor": "#F5F1E8",
+                "subtitleSize": 48, "cardPosition": "left", "titleCase": "bold"}
+    replacement = {**previous, "background": "#FAF6EC", "subtitleSize": 60}
+    project = service.create({"title": "已有显式参数后修改风格", "settings": {"visual_parameters": previous}})
+    settings = {"visual_style": "米白杂志风", "subtitle_style": "大字幕"}
+    if parameter_input == "echo_previous":
+        settings["visual_parameters"] = previous
+    elif parameter_input == "explicit_new":
+        settings["visual_parameters"] = replacement
+
+    updated = service.patch(project["id"], {"settings": settings})
+
+    assert updated["settings"]["visual_style"] == "米白杂志风"
+    if parameter_input == "explicit_new":
+        assert updated["settings"]["visual_parameters"] == replacement
+    else:
+        # Next build must interpret the newly requested style instead of using
+        # an old explicit parameter block silently carried forward by the UI.
+        assert "visual_parameters" not in updated["settings"]
+
+
+@pytest.mark.parametrize("subtitle_selection", ["omitted", "same_old_path", "new_path"])
+def test_replacing_recording_clears_old_transcript_binding_but_preserves_originals(service, tmp_path, subtitle_selection):
+    original = tmp_path / "original.mp4"
+    original.write_bytes(b"original-recording")
+    old_subtitle, new_subtitle = tmp_path / "original.srt", tmp_path / "replacement.srt"
+    old_subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n原片字幕\n", encoding="utf-8")
+    new_subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n新片字幕\n", encoding="utf-8")
+    project = service.create({"title": "替换录制"})
+    project["media"] = {"source_path": str(original), "transcript_path": str(old_subtitle),
+                        "generated_transcript_path": "artifacts/transcript.json", "transcript_source_sha256": "old-source-hash"}
+    for node in project["nodes"]:
+        node.update(status="completed", version=1, approved_version=1)
+    service.save(project)
+    incoming = {"source_path": str(tmp_path / "replacement.mp4")}
+    if subtitle_selection != "omitted":
+        incoming["transcript_path"] = str(new_subtitle if subtitle_selection == "new_path" else old_subtitle)
+
+    updated = service.patch(project["id"], {"media": incoming})
+
+    if subtitle_selection == "new_path":
+        assert updated["media"]["transcript_path"] == str(new_subtitle)
+    else:
+        assert "transcript_path" not in updated["media"]
+    assert "generated_transcript_path" not in updated["media"]
+    assert "transcript_source_sha256" not in updated["media"]
+    assert node_of(updated, "script")["status"] == "completed"
+    assert all(node_of(updated, name)["status"] == "stale" for name in ("source", "transcript", "build", "deliver"))
+    assert original.read_bytes() == b"original-recording"
+    assert "原片字幕" in old_subtitle.read_text(encoding="utf-8")
+
+
+def test_review_feedback_is_delivered_to_selected_upstream_node_once(service):
+    seen = []
+
+    class Executor:
+        async def execute(self, project, node, options, *args):
+            seen.append((node, options.get("feedback")))
+            return {"message": "已按本次意见生成修订稿"}
+
+    async def scenario():
+        service.executor = Executor()
+        project = service.create({"title": "从样片反馈到写稿"})
+        for node in project["nodes"]:
+            node.update(status="completed", version=1, approved_version=1)
+        service.save(project)
+        feedback = "请把第二段的抽象结论改为一个施工现场例子。"
+        updated = service.feedback(project["id"], "review", feedback, "script")
+        assert node_of(updated, "brief")["status"] == "completed"
+        assert node_of(updated, "script")["status"] == "stale"
+        assert node_of(updated, "review")["status"] == "stale"
+        await service.run(project["id"], "script", {})
+        await service.tasks[project["id"]]
+        assert seen == [("script", feedback)]
+        await service.run(project["id"], "script", {})
+        await service.tasks[project["id"]]
+        assert seen == [("script", feedback), ("script", None)]
+
+    asyncio.run(scenario())
+
+
 def test_note_import_stays_in_vault_and_keeps_original(service, tmp_path):
     note = service.vault / "我的文章.md"
     note.write_text("原始资料", encoding="utf-8")
@@ -130,6 +244,44 @@ def test_failure_and_cancel_never_advance(service):
         failed = node_of(service.get(p["id"]), "brief")
         assert failed["status"] == "failed"
         assert failed["message"] == "依赖文件缺失"
+    asyncio.run(scenario())
+
+
+def test_retry_preserves_old_failure_reason_without_persisting_credentials(service, monkeypatch):
+    secret = "fixture-workflow-secret-123456789"
+    monkeypatch.setenv("EASEL_WORKFLOW_KEY", secret)
+
+    async def scenario():
+        class Executor:
+            attempts = 0
+
+            async def execute(self, *args):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("upstream refused request; Authorization: Bearer " + secret)
+                return {"message": "重试已生成新的简报，请审阅"}
+
+        service.executor = Executor()
+        project = service.create({"title": "保留可诊断的失败记录"})
+        await service.run(project["id"], "brief", {})
+        await service.tasks[project["id"]]
+        failed_node = node_of(service.get(project["id"]), "brief")
+        assert failed_node["status"] == "failed"
+        failed_message = failed_node["message"]
+        assert "upstream refused request" in failed_message
+        assert secret not in failed_message
+
+        await service.run(project["id"], "brief", {})
+        await service.tasks[project["id"]]
+        restored = ContentWorkflowService(service.root, service.vault).get(project["id"])
+        node = node_of(restored, "brief")
+        assert node["status"] == "awaiting_review"
+        assert node["runs"][0]["status"] == "failed"
+        assert node["runs"][0]["message"] == failed_message
+        assert node["runs"][1]["message"] == "重试已生成新的简报，请审阅"
+        assert secret not in json.dumps(restored)
+        assert secret not in (service.directory(project["id"]) / "project.json").read_text(encoding="utf-8")
+
     asyncio.run(scenario())
 
 

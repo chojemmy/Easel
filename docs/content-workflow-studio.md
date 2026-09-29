@@ -13,6 +13,10 @@ Easel 左侧的“内容工作流”把一个视频或一篇文章保存为一�
 
 工作流不会替用户凭空确认分镜和预览。自动检查通过只表示技术产物满足检查条件，创意与内容仍在待确认节点中审阅。
 
+可用 `/?workflow=<项目 ID>` 直达项目，刷新会恢复；打开链接不会自动执行节点。
+
+当前画面模板支持保留原声的连续原片、真实时间戳字幕和少量章节卡。自动粗剪、插入 B-roll、配乐和任意新布局尚未接入此面板；仅修改 Skill 不会凭空增加这些能力。不支持的视觉要求会写入构建报告。平台草稿目前接通视频号，公开视频发布接通视频号和快手；其他平台在面板中禁用。实际发布仍依赖平台页面与登录状态，不能用本地发布包代替成功回执。
+
 ## 节点与职责
 
 | 节点 | 输入 | 输出与确认 |
@@ -59,6 +63,23 @@ Easel 左侧的“内容工作流”把一个视频或一篇文章保存为一�
 创意节点通过 `workflow_model.py` 直接请求已配置模型的文本接口，不执行自由 Agent 工具循环。返回内容必须符合节点所需格式。确定性的媒体检查、SDK 调用、模板构建、渲染和发布由固定程序执行。
 
 默认读取本机 OpenClaw 的 MiniMax 模型配置，凭证仅取环境变量。可用 `EASEL_WORKFLOW_MODEL`、`EASEL_WORKFLOW_BASE_URL`、`EASEL_WORKFLOW_API` 和 `EASEL_WORKFLOW_KEY` 配置独立模型；跨服务改地址需要显式提供对应 Key。Windows 使用既有受保护服务启动器，使密钥只进入进程环境。
+
+## 模型预算与固定参数
+
+画面节点使用内置模板默认参数或明确提供的 `visual_parameters` 时直接构建，不请求模型。需要解释自定义风格或个人 Skill 时，模型只负责返回受限视觉 JSON；宿主承担文件读取、工具检查和渲染。完整 Skill 仍保留在输入中，但系统提示明确当前请求是无工具的文本/JSON 编写任务。
+
+截至 2026-09-29，MiniMax 官方文档说明 `MiniMax-M3.1-Flash-Preview` 默认思考档位为 `max`，而且不能关闭思考：传 `thinking.type=disabled` 或 `effort=none` 会报错。思考也计入 `max_tokens`，因此很短的预期 JSON 仍可能耗尽生成额度。此前适配器省略了 effort，实际使用最高档位；现在短参数请求显式选择 `low`，不使用未经该模型文档确认的 `budget_tokens`。[Anthropic 兼容接口说明](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)
+
+`workflow_model.generate()` 的预算按单次请求选择，不改变其他节点：
+
+| `task` | 默认生成上限 | 总超时上限 | 推理设置 |
+|---|---:|---:|---|
+| `default` / `script` | 8192 tokens | 240 秒 | 保留供应商默认行为；长稿不采用短 JSON 预算 |
+| `short_json` | 2048 tokens | 60 秒 | M3.1 Flash 使用 `low`；M3 使用官方支持的关闭思考；M2 和未知模型不猜测控制字段 |
+
+构造模型实例时若指定更短超时，仍以较短值为准。调用方可用 `max_tokens` 明确覆盖本次额度（工作流接受 256–32768），以及为已验证的 M3.1 Flash 指定 `effort`（`low`、`medium`、`high`、`xhigh`、`max`）。Anthropic 格式映射为 `output_config.effort`，MiniMax OpenAI 兼容格式映射为 `reasoning_effort`。[OpenAI 兼容接口说明](https://platform.minimax.cn/docs/api-reference/text-openai-api)
+
+额度耗尽、超时或输出格式错误都会明确失败，不以不完整内容冒充成功，也不会自动重试或切换模型。低思考档位减少不必要的推理，但不保证所有复杂偏好都能在短预算内完成；模板不支持的要求仍须明确列出。
 
 ## 验证
 

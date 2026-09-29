@@ -137,9 +137,23 @@ def validate_visual(value: dict, template: str) -> dict:
     return {**value, "unsupported_requests": unsupported, "template": template}
 
 
-async def generate(prompt: str, *, system: str):
+def display_captions(captions: list[dict]) -> tuple[list[dict], list[int]]:
+    """Wrap presentation only; never estimate or split the source timestamps."""
+    rendered, long_indices = [], []
+    for index, caption in enumerate(captions):
+        text = str(caption.get("text") or "")
+        lines = []
+        for paragraph in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            lines.extend(paragraph[offset:offset + 18] for offset in range(0, len(paragraph), 18))
+        if len(lines) > 2:
+            long_indices.append(index)
+        rendered.append({**caption, "text": "\n".join(lines)})
+    return rendered, long_indices
+
+
+async def generate(prompt: str, *, system: str, task: str | None = None):
     from .workflow_model import generate as model_generate
-    result = await model_generate(prompt, system=system)
+    result = await model_generate(prompt, system=system, **({"task": task} if task else {}))
     return result
 
 
@@ -309,7 +323,27 @@ class _Run:
         feedback = self.options.get("feedback") or self.options.get("notes")
         if feedback and str(feedback) not in prompt:
             prompt += f"\n本次修改意见（仅在本节点支持范围内执行）：{feedback}"
-        return await generate(prompt, system=str(self.skill.get("content") or "按输入要求输出，不执行外部动作。"))
+        system = "你是文本/JSON编写器，没有工具，不能读取文件或运行命令。Skill中的执行性条款由宿主程序处理；本请求只输出用户prompt指定的文本或JSON产物，不讨论或模拟执行过程。下面保留全部Skill，供内容与偏好遵循：\n\n" + str(self.skill.get("content") or "按输入要求输出，不执行外部动作。")
+        return await generate(prompt, system=system, **({"task":"short_json"} if self.node == "build" else {}))
+
+    async def visual_parameters(self, settings: dict, template: str) -> tuple[dict, str]:
+        explicit = None
+        if "visual_parameters" in settings:
+            explicit = validate_visual(settings["visual_parameters"],template)
+            if not (self.options.get("feedback") or self.options.get("notes")):
+                return explicit, "explicit"
+        baseline = self.skill.get("source") == "builtin" and not self.skill.get("personalized")
+        unchanged_style = str(settings.get("visual_style") or "").strip() in {"", "克制科技纪录片", "克制、清晰"}
+        unchanged_captions = str(settings.get("subtitle_style") or "").strip() in {"", "清晰双行", "清晰易读"}
+        if baseline and unchanged_style and unchanged_captions and not (self.options.get("feedback") or self.options.get("notes")):
+            defaults = {"background":"#182020","accent":"#D1B479","textColor":"#F5F1E8","subtitleSize":48,"cardPosition":"left","titleCase":"bold"}
+            if template == "editorial":
+                defaults.update(background="#E9E4DB",accent="#768275",textColor="#172120")
+            return validate_visual(defaults,template), "default"
+        prompt = f"为固定口播模板选择视觉参数，返回JSON：background/accent/textColor为六位HEX颜色，subtitleSize数值36–72（1080p基准），cardPosition为left或right，titleCase为normal或bold；另可含unsupported_requests简短字符串数组。模板固有功能：持续原片A-roll和原声、真实时间戳字幕、少量章节卡；竖屏章节卡已放下方安全区避免遮脸，横屏左右位置由cardPosition选择；字幕已固定为安全底部白字+黑色半透明底，显示文本每行最多18字符，典型两行，超过36字符会保留多行并适当缩小字号，不改变时间轴。textColor只影响卡片文字等非字幕文字。以上内置行为无需列入unsupported_requests。可配置色彩、字号、横屏卡片位置和字重；不支持新布局、B-roll插入、3D、自动粗剪、时间戳重分段、额外特效或音乐。如果用户或Skill要求超出这些能力，必须如实列入unsupported_requests，不能声称已实现。不要输出代码。依据当前Skill、内容与用户风格决定参数，保持可读。模板：{template}；内容：{self.project.get('title')}；视觉要求：{settings.get('visual_style','克制科技纪录片')}；字幕要求：{settings.get('subtitle_style','清晰易读')}。"
+        if explicit is not None:
+            prompt += "\n以下显式参数是修改前参考基线，不能覆盖本次修改意见；只调整意见涉及的参数，其余尽量保持：" + json.dumps({key:value for key,value in explicit.items() if key not in {"template","unsupported_requests"}},ensure_ascii=False)
+        return validate_visual(parse_json_reply(await self.model(prompt)),template), "model"
 
     async def step_brief(self):
         settings = self.project.get("settings") or {}
@@ -464,11 +498,12 @@ class _Run:
             raise RunnerBlocked("分镜属于旧原片，请重新生成分镜。")
         timeline = validate_timeline({"scenes": saved_timeline["scenes"]}, metadata["duration"])
         captions = read_json(self.artifacts / "captions.json")
+        presented_captions, long_caption_indices = display_captions(captions)
         settings = self.project.get("settings") or {}
         template = settings.get("template", "documentary")
         if template not in {"documentary", "editorial"}:
             raise RunnerBlocked("当前模板只支持 documentary/editorial。")
-        visual = validate_visual(parse_json_reply(await self.model(f"为固定口播模板选择视觉参数，返回JSON：background/accent/textColor为六位HEX颜色，subtitleSize数值36–72（1080p基准），cardPosition为left或right，titleCase为normal或bold；另可含unsupported_requests简短字符串数组。模板仅能配置色彩、字号、卡片左右位置和字重，持续A-roll+真实字幕+少量章节卡；不支持新布局、B-roll插入、3D、自动粗剪、特效、额外音乐。如果用户或Skill要求超出这些能力，必须如实列入unsupported_requests，不能声称已实现。不要输出代码。依据当前Skill、内容与用户风格决定参数，保持可读。模板：{template}；内容：{self.project.get('title')}；视觉要求：{settings.get('visual_style','克制科技纪录片')}；字幕要求：{settings.get('subtitle_style','清晰易读')}。")), template)
+        visual, params_origin = await self.visual_parameters(settings,template)
         modules = self.runner.deps / "node_modules"
         for package in ("remotion", "@remotion/cli", "@remotion/media"):
             if read_json(modules / package / "package.json").get("version") != "4.0.503":
@@ -512,16 +547,19 @@ class _Run:
                 await asyncio.to_thread(shutil.copy2, original, local_source)
         ratio = settings.get("output_ratio", "16:9")
         width, height = {"16:9": (1920,1080), "9:16": (1080,1920), "1:1": (1080,1080)}.get(ratio, (1920,1080))
-        props = {"source": local_source.name, "source_sha256":metadata.get("source_sha256"), "title": self.project.get("title", ""), "duration": metadata["duration"], "width": width, "height": height, "fps":30, "captions":captions, "scenes": timeline["scenes"], "visual":visual}
+        props = {"source": local_source.name, "source_sha256":metadata.get("source_sha256"), "title": self.project.get("title", ""), "duration": metadata["duration"], "width": width, "height": height, "fps":30, "captions":presented_captions, "scenes": timeline["scenes"], "visual":visual}
         props_path = write_json(self.work / "props.json", props)
         preflight = Path(os.environ.get("AGENT_VAULT", "D:/第二大脑/_Agent")) / "skills/remotion-video-production/scripts/remotion_preflight.py"
         if preflight.is_file():
             await self.command([self.python, preflight, "--project", self.work, "--captions", self.artifacts / "captions.json", "--json"], label="Remotion 静态预检")
         await self.remotion("compositions", "--props", props_path)
-        report = write_json(self.artifacts / "build-report.json", {"composition":"WorkflowVideo", "template":template, "version":"4.0.503", "visual":visual, "static_preflight":"passed" if preflight.is_file() else "unavailable", "compositions":"passed", "timeline_mode":"original_no_cuts", "skill_applied":"model_constrained_visual_props", "unsupported_requests":visual["unsupported_requests"], "capabilities":"模板色彩、字幕字号、卡片位置和字重；新布局需扩展模板"})
-        message = "隔离模板通过 composition 枚举；Skill 已应用到色彩、字幕字号和卡片参数，新布局需扩展模板。"
+        report = write_json(self.artifacts / "build-report.json", {"composition":"WorkflowVideo", "template":template, "version":"4.0.503", "visual":visual, "params_origin":params_origin, "static_preflight":"passed" if preflight.is_file() else "unavailable", "compositions":"passed", "timeline_mode":"original_no_cuts", "caption_layout":{"max_characters_per_line":18,"typical_lines":2,"long_caption_indices":long_caption_indices,"timestamps_changed":False,"long_segment_policy":"保留全部文字并缩小字号；建议人工校对拆段，不估算新时间戳"}, "skill_applied":"model_constrained_visual_props" if params_origin == "model" else "host_guards_and_explicit_props" if params_origin == "explicit" else "builtin_fixed_template", "unsupported_requests":visual["unsupported_requests"], "capabilities":"模板色彩、字幕字号、卡片位置和字重；新布局需扩展模板"})
+        origin_label = {"model":"按 Skill 映射的模型参数", "explicit":"已验证的显式参数（未调用模型解析文字意见）", "default":"内置固定参数（无需模型请求）"}[params_origin]
+        message = f"隔离模板通过 composition 枚举；本次使用{origin_label}，新布局需扩展模板。"
         if visual["unsupported_requests"]:
             message += " 尚未实现：" + "；".join(visual["unsupported_requests"])
+        if long_caption_indices:
+            message += f" {len(long_caption_indices)} 条字幕超过两行，保留完整文字并缩小显示；请在样片中校对，必要时人工拆段。"
         return {"status":"completed", "message":message, "artifacts":[self.artifact(props_path,"模板参数"),self.artifact(report,"构建检查报告"),self.artifact(self.work / "src/Root.tsx","可复用源码")]}
 
     async def step_review(self):
