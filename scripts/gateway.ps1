@@ -23,6 +23,25 @@ function Stop-Gateway {
     else { Write-Host '[easel] Gateway was not running' }
 }
 
+function Test-ProtectedEnvironment {
+    $key = [Environment]::GetEnvironmentVariable('MINIMAX_API_KEY', 'Process')
+    return -not [string]::IsNullOrWhiteSpace($key) -and -not $key.StartsWith('${')
+}
+
+# 直接运行本脚本不会解开 DPAPI 凭证，启动出的网关虽然 healthz 为绿，真正对话却会报
+# SecretSurfaceUnavailableError。缺少进程内密钥时转交受保护的总入口；总入口注入密钥后
+# 再次调用 gateway.ps1，此时不会递归。
+if ($args[0] -in @('start', 'restart') -and -not (Test-ProtectedEnvironment)) {
+    $serviceScript = Join-Path $PSScriptRoot 'easel-services.ps1'
+    if (-not (Test-Path -LiteralPath $serviceScript)) {
+        Write-Error "Protected Easel launcher not found: $serviceScript"
+        exit 1
+    }
+    Write-Host '[easel] Protected credentials are not loaded; delegating to easel-services.ps1.'
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $serviceScript $args[0]
+    exit $LASTEXITCODE
+}
+
 switch ($args[0]) {
     'start' {
         if (Test-Gateway) { Write-Host '[easel] Gateway already running'; break }

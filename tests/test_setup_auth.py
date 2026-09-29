@@ -305,6 +305,19 @@ def test_ps1_auth_branches_guard_base_url():
         assert re.search(pattern, text), f"{key} 分支缺少括号化的 {companion} 守卫"
 
 
+def test_ps1_minimax_has_stable_fallback_and_request_limits():
+    """Preview 拥塞时要切正式版，并避免后台复盘/并发把 529 放大。"""
+    text = SETUP_PS1.read_text(encoding="utf-8")
+    assert "minimax/MiniMax-M3.1-Flash-Preview" in text
+    assert "minimax/MiniMax-M3" in text
+    assert "agents.defaults.model.fallbacks" in text
+    assert "agents.defaults.maxConcurrent' '1'" in text
+    assert "agents.defaults.subagents.maxConcurrent' '1'" in text
+    assert "skills.workshop.autonomous.mode' 'off'" in text
+    assert 'provider["maxRetries"] = 4' in text
+    assert 'provider["maxRetryDelayMs"] = 30000' in text
+
+
 # ── install_tool：别展开、别降级用户 PATH ──────────────────────────────
 
 

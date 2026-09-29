@@ -301,12 +301,29 @@ if ((Is-UsableKey $envValues['OPENAI_MAAS_API_KEY']) -and $envValues.ContainsKey
         @{ path = 'agents.defaults.model.primary'; value = "openai/$model" }
     )
 } elseif ((Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and $envValues.ContainsKey('EASEL_LLM_BASE_URL')) {
-    # 原子写入整块 provider（含 header 与 anthropic-version）；整块替换会顺带清掉旧的专用 header。
-    $hdr = if ($envValues.ContainsKey('EASEL_LLM_API_KEY_HEADER')) { $envValues['EASEL_LLM_API_KEY_HEADER'] } else { 'api-key' }
-    $ver = if ($envValues.ContainsKey('EASEL_LLM_ANTHROPIC_VERSION')) { $envValues['EASEL_LLM_ANTHROPIC_VERSION'] } else { '2023-06-01' }
-    Write-AnthropicProvider $envValues['EASEL_LLM_BASE_URL'] $envValues['EASEL_LLM_API_KEY'] $hdr $ver
-    $anthropicSynced = $true
-    OpenClaw-Config 'agents.defaults.model.primary' $(if ($envValues.ContainsKey('CLAUDE_MODEL')) { $envValues['CLAUDE_MODEL'] } else { 'anthropic/claude-sonnet-4-6' })
+    $primaryModel = if ($envValues.ContainsKey('CLAUDE_MODEL')) { $envValues['CLAUDE_MODEL'] } else { 'anthropic/claude-sonnet-4-6' }
+    # MiniMax Token Plan 的 Flash Preview 偶发返回 529 overloaded。为它登记正式版 M3
+    # 作为同供应商兜底；仍使用同一 Token Plan，不会意外切到按量付费供应商。
+    if (($primaryModel -match '^minimax/') -and ($envValues['EASEL_LLM_BASE_URL'] -match '^https://api\.minimax(i)?\.(cn|com|io)(/|$)')) {
+        $models = @(
+            @{ id = 'MiniMax-M3.1-Flash-Preview'; name = 'MiniMax M3.1 Flash Preview'; reasoning = $true; input = @('text', 'image'); contextWindow = 1000000; maxTokens = 131072 },
+            @{ id = 'MiniMax-M3'; name = 'MiniMax M3'; reasoning = $true; input = @('text', 'image'); contextWindow = 1000000; maxTokens = 131072 }
+        )
+        $provider = @{ baseUrl = $envValues['EASEL_LLM_BASE_URL']; apiKey = $envValues['EASEL_LLM_API_KEY']; api = 'anthropic-messages'; timeoutSeconds = 600; models = $models }
+        $fallbacks = if ($primaryModel -eq 'minimax/MiniMax-M3') { @('minimax/MiniMax-M3.1-Flash-Preview') } else { @('minimax/MiniMax-M3') }
+        OpenClaw-ConfigBatch @(
+            @{ path = 'models.providers.minimax'; value = $provider },
+            @{ path = 'agents.defaults.model.primary'; value = $primaryModel },
+            @{ path = 'agents.defaults.model.fallbacks'; value = $fallbacks }
+        )
+    } else {
+        # 原子写入整块 provider（含 header 与 anthropic-version）；整块替换会顺带清掉旧的专用 header。
+        $hdr = if ($envValues.ContainsKey('EASEL_LLM_API_KEY_HEADER')) { $envValues['EASEL_LLM_API_KEY_HEADER'] } else { 'api-key' }
+        $ver = if ($envValues.ContainsKey('EASEL_LLM_ANTHROPIC_VERSION')) { $envValues['EASEL_LLM_ANTHROPIC_VERSION'] } else { '2023-06-01' }
+        Write-AnthropicProvider $envValues['EASEL_LLM_BASE_URL'] $envValues['EASEL_LLM_API_KEY'] $hdr $ver
+        $anthropicSynced = $true
+        OpenClaw-Config 'agents.defaults.model.primary' $primaryModel
+    }
 } elseif ((Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN']) -and $envValues.ContainsKey('ANTHROPIC_BASE_URL')) {
     Write-AnthropicProvider $envValues['ANTHROPIC_BASE_URL'] $envValues['ANTHROPIC_AUTH_TOKEN'] '' ''
     $anthropicSynced = $true
@@ -343,7 +360,33 @@ if ($embeddingKey -and $embeddingUrl -and $embeddingModel) {
     }
     if (($embeddingKeyNames + $embeddingUrlNames + $embeddingModelNames | Where-Object { $envValues.ContainsKey($_) }).Count -gt 0) { Write-Warning '向量 API 配置不完整，已关闭向量检索；需要同时设置向量 API key、Base URL 和模型名' } else { Info '未配置独立向量 API，使用关键词记忆检索' }
 }
-OpenClaw-Config 'agents.defaults.timeoutSeconds' '7200'; OpenClaw-Config 'gateway.mode' 'local'; OpenClaw-Config 'gateway.bind' 'loopback'; OpenClaw-Config 'gateway.auth.mode' 'none'
+OpenClaw-Config 'agents.defaults.timeoutSeconds' '7200'; OpenClaw-Config 'agents.defaults.maxConcurrent' '1' -Json; OpenClaw-Config 'agents.defaults.subagents.maxConcurrent' '1' -Json; OpenClaw-Config 'gateway.mode' 'local'; OpenClaw-Config 'gateway.bind' 'loopback'; OpenClaw-Config 'gateway.auth.mode' 'none'
+# Skill Workshop 默认会在用户任务后额外启动模型复盘；Easel 以稳定发布为主，保留手动建议、关闭后台自动调用。
+if (-not (Try-OpenClawConfig 'skills.workshop.autonomous.mode' 'off')) {
+    Info '当前 OpenClaw 不支持 Skill Workshop 限流配置，已跳过。'
+}
+# Agent runtime 的 provider 重试参数存放在项目级 .openclaw/settings.json，而不是 openclaw.json。
+# 先短退避，再让模型 fallback 接管，避免对拥塞中的 Preview 连打八次后才报错。
+$retryDir = Join-Path $Root '.openclaw'
+$retryFile = Join-Path $retryDir 'settings.json'
+New-Item -ItemType Directory -Force -Path $retryDir | Out-Null
+$retrySeed = @'
+import json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+except (OSError, json.JSONDecodeError):
+    data = {}
+retry = data.setdefault("retry", {})
+retry["enabled"] = True
+provider = retry.setdefault("provider", {})
+provider["maxRetries"] = 4
+provider["maxRetryDelayMs"] = 30000
+path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+'@
+$retrySeed | & $Python - $retryFile
+if ($LASTEXITCODE -ne 0) { Fail 'OpenClaw provider 重试配置写入失败。' }
 # 对话直连常驻网关（web/app.py 的 http 传输层）要用 OpenAI 兼容端点，而 openclaw 默认不挂这条
 # 路由（chatCompletions.enabled 默认 false），不开则 POST /v1/chat/completions 一律 404、只能
 # 退回每轮 spawn 客户端的老路径。端点只绑 loopback + auth.mode=none 的本机网关，不扩暴露面。

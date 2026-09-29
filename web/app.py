@@ -319,7 +319,8 @@ def _wechat_verify_token() -> tuple[bool, str]:
     ) % (str(WECHAT_SKILL_SCRIPTS), WECHAT_WEB_ACCOUNT)
     try:
         proc = subprocess.run([sys.executable, "-c", code], cwd=str(WECHAT_SKILL_SCRIPTS),
-                              env=_wechat_env(), capture_output=True, text=True, timeout=30)
+                              env=_wechat_env(), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=30)
     except subprocess.TimeoutExpired:
         return False, "验证超时（网络或 IP 白名单问题）"
     out = (proc.stdout or "").strip().splitlines()
@@ -550,6 +551,12 @@ def clean_agent_output(raw: str) -> str:
 def _proxy_env() -> dict[str, str]:
     """返回带外网代理的环境变量（保护内网直连）。"""
     env = os.environ.copy()
+    # Windows 中文区域默认让 Python 子进程使用 GBK。登录脚本会输出 emoji，
+    # 若仍沿用 GBK，日志打印本身会抛 UnicodeEncodeError，并把已经成功的登录
+    # 误写成 error。所有由 Web 启动的 Python 子进程统一使用 UTF-8；对应的
+    # capture_output 调用也显式按 UTF-8 解码，避免父子进程编码不一致。
+    env['PYTHONUTF8'] = '1'
+    env['PYTHONIOENCODING'] = 'utf-8'
     env.setdefault('EASEL_ROOT', str(PROJECT_ROOT))
     env.setdefault('http_proxy', os.environ.get('EASEL_PROXY', ''))
     env.setdefault('https_proxy', os.environ.get('EASEL_PROXY', ''))
@@ -795,7 +802,8 @@ def run_agent_sync(msg: str, timeout: int = TIMEOUT_DIRECT, session_id: str | No
     if not xlock.acquire(timeout=min(timeout, 300)):
         return '⏳ 这个会话正在另一个窗口运行，请稍候再试'
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           cwd=str(PROJECT_ROOT), timeout=timeout + 30, env=_proxy_env())
         return clean_agent_output(r.stdout or '') or '（无输出）'
     except subprocess.TimeoutExpired:
         return '⏱️ 请求超时'
@@ -2173,7 +2181,8 @@ async def api_chat_stream(req: ChatRequest):
             try:
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
+                    cwd=str(PROJECT_ROOT), text=True, encoding='utf-8', errors='replace',
+                    bufsize=1, env=env,
                 )
             except BaseException:
                 lock.release()
@@ -3188,7 +3197,8 @@ async def api_account_whoami(platform: str):
                '--platform', cfg['wp']]
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                                       capture_output=True, text=True, timeout=150)
+                                       capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                       timeout=150)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '校验超时（浏览器起不来或网络慢）')
     data = {'loggedIn': False, 'name': '', 'avatar': ''}
@@ -3320,7 +3330,8 @@ async def api_analytics(platform: str):
     ana_env = _proxy_env()
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=ana_env,
-                                       capture_output=True, text=True, timeout=180)
+                                       capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                       timeout=180)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "抓取超时（浏览器起不来或网络慢）")
     for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -3376,7 +3387,8 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
     out = err = ''
     try:
         proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_publish_env(),
-                              capture_output=True, text=True, timeout=900)
+                              capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=900)
         ok = proc.returncode == 0
         out, err = proc.stdout or '', proc.stderr or ''
     except subprocess.TimeoutExpired:
@@ -3518,8 +3530,8 @@ async def api_publish(platform: str, req: PublishRequest):
         md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
         conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
                                str(md_path), '-o', str(html_path)],
-                              cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=60)
+                               cwd=str(PROJECT_ROOT), env=_proxy_env(),
+                               capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
         if conv.returncode != 0 or not html_path.is_file():
             raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
         wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
@@ -3537,7 +3549,8 @@ async def api_publish(platform: str, req: PublishRequest):
     pub_env = _proxy_env() if platform == 'wechat-oa' else _publish_env()
     try:
         proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=pub_env,
-                                       capture_output=True, text=True, timeout=600)
+                                       capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                       timeout=600)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '发布超时（媒体处理慢或流程卡住）')
     ok = proc.returncode == 0
@@ -3900,7 +3913,8 @@ async def api_schedule_context(days: int = 14):
            "--data", str(SCHEDULE_FILE), "context", "--days", str(max(1, min(days, 90)))]
     try:
         proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=20)
         return json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else {}
     except Exception:
         return {}

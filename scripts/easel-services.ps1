@@ -22,6 +22,11 @@ $SecretFile = Join-Path $LocalState 'secrets.dpapi.json'
 $LogDir = Join-Path $LocalState 'logs'
 $GatewayScript = Join-Path $PSScriptRoot 'gateway.ps1'
 
+# Windows 中文区域的 Python 默认标准输出为 GBK；Easel 的脚本日志包含 emoji。
+# 服务及其后代进程统一使用 UTF-8，避免一次日志输出失败破坏真实业务状态。
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+
 function Write-Status([string]$Message) {
     Write-Host "[easel] $Message"
 }
