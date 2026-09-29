@@ -19,14 +19,14 @@ export interface WorkflowProject {
   id: string; title: string; kind: WorkflowKind; created_at: string; updated_at: string; content_version: number;
   brief: WorkflowBrief; manuscripts: WorkflowManuscript[]; primary_manuscript_id?: string;
   media: { source_path?: string; transcript_path?: string; [key: string]: unknown };
-  nodes: WorkflowNode[]; settings: Record<string, unknown>; archive?: Record<string, unknown>;
+  nodes: WorkflowNode[]; settings: Record<string, unknown>; archive?: ArchivePreview & { at?: string; outdated?: boolean };
 }
 export interface WorkflowDefinition { id: WorkflowNodeId; title: string; description?: string; skills?: string[]; }
 export interface WorkflowIndex { projects: WorkflowProject[]; nodes: WorkflowDefinition[]; defaults: { vault?: string; output_dir?: string; [key: string]: unknown }; }
 export interface WorkflowSkill { name?: string; path?: string; content?: string; body?: string; version?: string; }
 export interface WorkflowSkills { version?: string; content?: string; body?: string; target_path?: string; skills?: (WorkflowSkill | string)[]; [key: string]: unknown; }
 export interface LearningProposal { proposal_id: string; before: string; after: string; diff: string | string[]; base_version: string; target_path?: string; after_version?: string; [key: string]: unknown; }
-export interface ArchivePreview { status?: string; target_path?: string; path?: string; content?: string; markdown?: string; hash?: string; expected_hash?: string; targets?: { path: string; action: string; before_hash?: string; after_hash?: string }[]; plan?: { note_path?: string; primary_manuscript_id?: string; status?: string }; files?: unknown[]; [key: string]: unknown; }
+export interface ArchivePreview { status?: string; target_path?: string; path?: string; content?: string; markdown?: string; hash?: string; expected_hash?: string; targets?: { path: string; action: string; before_hash?: string; after_hash?: string }[]; plan?: { note_path?: string; primary_manuscript_id?: string; status?: string; publication_status?: string }; files?: unknown[]; [key: string]: unknown; }
 export interface ObsidianNote { title: string; path: string; excerpt?: string; }
 
 const base = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '');
