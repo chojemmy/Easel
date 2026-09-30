@@ -13,10 +13,13 @@ from easel.workflow_runner import RunnerBlocked, WorkflowRunner, validate_timeli
 
 
 @pytest.fixture
-def case(tmp_path):
+def case(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     directory = root / "outputs/视频工作流/test-run"
     directory.mkdir(parents=True)
+    monkeypatch.setenv("EASEL_OPENCLAW_STATE_DIR", str(root / "isolated-openclaw"))
+    monkeypatch.delenv("EASEL_OPENCLAW_WORKSPACE", raising=False)
+    monkeypatch.delenv("EASEL_ROOT", raising=False)
     project = {"id":"test-run", "kind":"video", "title":"固定流程的价值", "content_version":1,
                "manuscripts":[{"id":"m1","title":"原稿","content":"用户自己的稿件","version":1,"is_primary":True}],
                "primary_manuscript_id":"m1","nodes":[],"settings":{},"media":{}}
@@ -32,7 +35,7 @@ def test_script_adopts_existing_and_preserves_every_manuscript(case, monkeypatch
     async def no_model(*args, **kwargs):
         pytest.fail("Adopting a manuscript must not spend a model request")
     monkeypatch.setattr(module,"generate",no_model)
-    result = execute(case,"script",action="adopt")
+    result = execute(case,"script",action="adopt",mode="generate",feedback="旧的修改意见")
     assert result["status"] == "awaiting_review"
     assert result["manuscripts"] == case[2]["manuscripts"]
     assert Path(result["artifacts"][0]["path"]).read_text(encoding="utf-8") == "用户自己的稿件"
@@ -60,6 +63,108 @@ def test_generation_reads_additional_obsidian_manuscripts(case,monkeypatch):
         return "综合稿"
     monkeypatch.setattr(module,"generate",model)
     assert execute(case,"script",mode="generate")["status"]=="awaiting_review"
+
+
+@pytest.mark.parametrize("options", [{"mode":"generate"}, {"feedback":"保留观点，开头更具体"}])
+def test_direct_script_generation_applies_original_skills_and_complete_references_once(case,monkeypatch,options):
+    guides={
+        "video-script":{"references/retention-scripting-guide.md":"结构指南：分章安排"},
+        "text-polisher":{
+            "references/phrases-to-remove.md":"删除清单：不写空泛套话",
+            "references/structures-to-avoid.md":"结构禁忌：避免机械对仗",
+            "references/zh-ai-markers.md":"中文指南：" + "口语表达。"*5000 + "完整分页末尾规则",
+            "references/checklist.md":"最终清单：检查事实归属",
+        },
+    }
+    originals={}
+    for name, references in guides.items():
+        base=case[0]/"skills/openclaw"/name
+        (base/"references").mkdir(parents=True)
+        body=f"---\nname: {name}\n---\n原始{name}方法\n" + "\n".join(f"必须读取 `{path}`" for path in references)
+        for path, content in {"SKILL.md":body,**references}.items():
+            source=base/path
+            source.write_text(content,encoding="utf-8")
+            originals[source]=source.read_bytes()
+    calls=[]
+    async def model(prompt,*,system):
+        calls.append(prompt)
+        assert "测试节点规范" in system
+        assert "用户自己的稿件" in prompt
+        for name, references in guides.items():
+            assert f"原始{name}方法" in system
+            for content in references.values():
+                assert content in system
+        assert "最终只输出可采用的稿件正文" in system and "并未因读取而执行" in system
+        return "写作与润色同时应用的新稿"
+    monkeypatch.setattr(module,"generate",model)
+    events=[]
+    result=asyncio.run(WorkflowRunner(case[0]).execute(case[2],"script",options,{"content":"测试节点规范"},case[1],events.append))
+    assert result["status"]=="awaiting_review" and len(calls)==1
+    assert len(result["manuscripts"])==2 and result["manuscripts"][0]["content"]=="用户自己的稿件"
+    reads=[event["text"] for event in events if isinstance(event,dict) and event["kind"]=="tool"]
+    assert len(reads)==7
+    assert len(result["library_skills_used"])==7
+    for name, references in guides.items():
+        for path in ["SKILL.md",*references]:
+            assert any(f"{name}/{path}" in text for text in reads)
+            record=next(item for item in result["library_skills_used"] if item["name"]==name and item["path"]==path)
+            assert set(record)=={"name","path","sha256"} and len(record["sha256"])==64
+    assert all(path.read_bytes()==content for path,content in originals.items())
+
+
+def test_missing_original_skills_are_reported_without_claiming_reads_or_blocking(case,monkeypatch):
+    calls=[]
+    async def model(prompt,*,system):
+        calls.append(prompt)
+        return "孤立项目稿件"
+    monkeypatch.setattr(module,"generate",model)
+    events=[]
+    result=asyncio.run(WorkflowRunner(case[0]).execute(case[2],"script",{"mode":"generate"},{"content":"节点规范"},case[1],events.append))
+    assert result["status"]=="awaiting_review" and len(calls)==1
+    assert result["library_skills_used"]==[]
+    assert not any(isinstance(e,dict) and e["kind"]=="tool" for e in events)
+    assert all(any(isinstance(e,dict) and f"未加载 {name}" in e["text"] for e in events) for name in ("video-script","text-polisher"))
+
+
+@pytest.mark.parametrize("node,name",[
+    ("brief","video-strategy"),("script","video-script"),("source","video-production"),
+    ("transcript","video-production"),("storyboard","video-production"),("build","video-production"),
+    ("review","skill-quality-gate"),("deliver","post-formatter"),
+    ("publish","skill-cross-platform-publish"),("archive","skill-publish-log"),
+])
+def test_each_node_reports_only_real_library_reads_without_running_skill_tools(case,monkeypatch,node,name):
+    source=case[0]/"skills/openclaw"/name/"SKILL.md"
+    source.parent.mkdir(parents=True)
+    content=f"---\nname: {name}\ndescription: 当前节点方法\n---\n\n已读取的节点规范。\n`python scripts/extra.py`\n"
+    source.write_bytes(content.encode("utf-8"))
+    called=[]
+    async def fixed_step(self):
+        called.append(self.node)
+        assert "已读取的节点规范" in self.library_guidance
+        return {"status":"completed","message":"固定守卫已检查本节点产物。"}
+    async def no_model(*args,**kwargs):pytest.fail("Reading a Skill must not trigger a model")
+    async def no_command(*args,**kwargs):pytest.fail("Reading a Skill must not execute its scripts")
+    monkeypatch.setattr(module._Run,f"step_{node}",fixed_step,raising=False)
+    monkeypatch.setattr(module._Run,"command",no_command)
+    monkeypatch.setattr(module,"generate",no_model)
+    result=execute(case,node)
+    assert result["library_skills_used"]==[{"name":name,"path":"SKILL.md","sha256":module.hashlib.sha256(content.encode("utf-8")).hexdigest()}]
+    assert called==([] if node=="archive" else [node])
+    assert result["status"]==("blocked" if node=="archive" else "completed")
+    assert source.read_bytes()==content.encode("utf-8")
+
+
+@pytest.mark.parametrize("platform,expected",[("weixin-channels","skill-channels-upload"),("kuaishou","skill-kuaishou-upload")])
+def test_publish_skill_matches_fixed_executor_platform(case,monkeypatch,platform,expected):
+    for name in ("skill-channels-upload","skill-kuaishou-upload"):
+        source=case[0]/"skills/openclaw"/name/"SKILL.md"
+        source.parent.mkdir(parents=True)
+        source.write_text(f"---\nname: {name}\ndescription: 平台发布\n---\n发布需回执。",encoding="utf-8")
+    case[2]["settings"]["publish_platform"]=platform
+    async def no_publish(self):return {"status":"blocked","message":"测试不提交"}
+    monkeypatch.setattr(module._Run,"step_publish",no_publish)
+    result=execute(case,"publish")
+    assert [item["name"] for item in result["library_skills_used"]]==[expected]
 
 
 def test_article_publication_package_does_not_require_video(case):
@@ -169,8 +274,9 @@ def test_generation_progress_streams_only_text_as_throttled_snapshots(case,monke
 def test_generation_budget_reaches_adapter_for_every_creative_node(case,monkeypatch,node,budget,expected):
     from easel import workflow_model
     calls=[]
-    async def adapter(prompt,*,system,on_text,generation_budget,task=None):
+    async def adapter(prompt,*,system,on_text,on_status,generation_budget,task=None):
         calls.append({"budget":generation_budget,"task":task})
+        on_status("模型繁忙，2 秒后重试。api_key=private-status-secret")
         on_text("真实正文")
         return "真实正文"
     monkeypatch.setattr(workflow_model,"generate",adapter)
@@ -182,6 +288,8 @@ def test_generation_budget_reaches_adapter_for_every_creative_node(case,monkeypa
     assert asyncio.run(runner.model("生成测试产物"))=="真实正文"
     assert calls==[{"budget":expected,"task":"short_json" if node=="build" else None}]
     assert {"kind":"generation","text":"真实正文"} in events
+    assert {"kind":"status","text":"模型繁忙，2 秒后重试。api_key=[REDACTED]"} in events
+    assert "private-status-secret" not in json.dumps(events)
 
 
 @pytest.mark.parametrize("exit_code",[0,7])

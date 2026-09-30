@@ -12,6 +12,23 @@
 .cw-archive-markdown { max-height: 450px; overflow: auto; padding: 18px; margin: 15px 0; background: #f8faf5; border-radius: 8px; }
 .cw-standard-preview { max-height: 260px; overflow: auto; margin-top: 13px; }
 .cw-standard-preview .cw-markdown { font-size: 11px; }
+.cw-original-skills h4 { margin-top: 16px; color: #6a7f66; }
+.cw-used-skill-list { display: grid; gap: 10px; margin-top: 10px; max-height: 330px; overflow: auto; }
+.cw-used-skill-list > div { border: 1px solid #e1e8da; border-radius: 7px; padding: 8px; }
+.cw-library-file { display: flex; flex-direction: column; gap: 4px; width: 100%; border: 0; background: transparent; color: #58734e; padding: 6px 0; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.cw-library-file strong { font-size: 11px; font-weight: 600; } .cw-library-file span { font-size: 10px; color: #87957b; line-height: 1.7; }
+.cw-library-file small { color: #a0ac90; font-size: 9px; }
+.cw-library-catalog { margin-top: 17px; padding-top: 12px; border-top: 1px solid #e5ebdd; }
+.cw-library-catalog summary { cursor: pointer; color: #728465; font-size: 11px; line-height: 1.7; }
+.cw-library-catalog > div { max-height: 370px; overflow: auto; margin-top: 9px; }
+.cw-library-catalog .cw-library-file { border-bottom: 1px solid #edf0e6; padding: 10px 0; }
+.cw-library-error { color: #a5533f !important; font-size: 11px; overflow-wrap: anywhere; }
+.cw-feedback-learn { display: block !important; margin-top: 5px; }
+.cw-learning-target-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+.cw-learning-source { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; border: 1px solid #dce7d5; border-radius: 7px; padding: 12px; margin: 14px 0; background: #f7faf3; }
+.cw-learning-source > span { font-size: 11px; color: #718a63; }
+.cw-learning-source code { color: #899879; font-size: 10px; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .cw-learning-target-grid { grid-template-columns: 1fr; } }
 .cw-page h1, .cw-page h2, .cw-page h3, .cw-page h4, .cw-page p { margin: 0; }
 .cw-page h1 { font-size: 28px; font-weight: 650; letter-spacing: -.7px; line-height: 1.4; }
 .cw-page h2 { font-size: 19px; font-weight: 650; line-height: 1.4; }

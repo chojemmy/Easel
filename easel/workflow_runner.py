@@ -154,13 +154,16 @@ def display_captions(captions: list[dict]) -> tuple[list[dict], list[int]]:
 
 async def generate(prompt: str, *, system: str, task: str | None = None,
                    on_text: Callable[[str], None] | None = None,
-                   generation_budget: str | None = None):
+                   generation_budget: str | None = None,
+                   on_status: Callable[[str], None] | None = None):
     from .workflow_model import generate as model_generate
     options = {"task": task} if task else {}
     if on_text is not None:
         options["on_text"] = on_text
     if generation_budget is not None:
         options["generation_budget"] = generation_budget
+    if on_status is not None:
+        options["on_status"] = on_status
     result = await model_generate(prompt, system=system, **options)
     return result
 
@@ -196,6 +199,8 @@ class _Run:
         self.work = self.directory / "remotion"
         self.sdk_run = self.directory / "sdk"
         self.python = str(self.root / ".venv/Scripts/python.exe") if (self.root / ".venv/Scripts/python.exe").is_file() else sys.executable
+        self.library_skills_used: list[dict] = []
+        self.library_guidance = ""
 
     def notify(self, text: str | dict):
         if self.progress:
@@ -305,6 +310,7 @@ class _Run:
         skill_path.parent.mkdir(parents=True, exist_ok=True)
         skill_path.write_text(clean_log(str(self.skill.get("content") or "（本节点未提供附加 Skill；使用固定执行守卫。）")), encoding="utf-8")
         try:
+            self.library_guidance = self.read_library_guidance()
             if self.node == "archive":
                 raise RunnerBlocked("归档由存档服务执行，请先预览存档计划。")
             result = await getattr(self, f"step_{self.node}")()
@@ -327,6 +333,7 @@ class _Run:
                 result["manual_verification_url"] = "https://channels.weixin.qq.com/" if receipt.get("platform") == "weixin-channels" else "https://cp.kuaishou.com/article/manage/video"
         result.setdefault("status", "awaiting_review")
         result.setdefault("artifacts", [])
+        result["library_skills_used"] = copy.deepcopy(self.library_skills_used)
         self.log(f"节点状态：{result['status']}")
         self.notify({"kind": "result", "text": result.get("message") or f"节点状态：{result['status']}"})
         result["artifacts"] += [self.artifact(skill_path, "本次执行 Skill"), self.artifact(self.log_path, "运行日志", "log")]
@@ -348,6 +355,8 @@ class _Run:
         if feedback and str(feedback) not in prompt:
             prompt += f"\n本次修改意见（仅在本节点支持范围内执行）：{feedback}"
         system = "你是文本/JSON编写器，没有工具，不能读取文件或运行命令。Skill中的执行性条款由宿主程序处理；本请求只输出用户prompt指定的文本或JSON产物，不讨论或模拟执行过程。下面保留全部Skill，供内容与偏好遵循：\n\n" + str(self.skill.get("content") or "按输入要求输出，不执行外部动作。")
+        if self.library_guidance:
+            system += self.library_guidance
         # on_text receives final-answer deltas only. The provider adapter owns
         # reasoning/thinking filtering; the runner never receives those fields.
         accumulated = ""
@@ -385,6 +394,8 @@ class _Run:
         accepts_options = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
         if "on_text" in parameters or accepts_options:
             options["on_text"] = on_text
+        if "on_status" in parameters or accepts_options:
+            options["on_status"] = lambda text: self.notify({"kind": "status", "text": text}) if isinstance(text, str) else None
         if "generation_budget" in parameters or accepts_options:
             options["generation_budget"] = (self.project.get("settings") or {}).get("generation_budget", "large")
         try:
@@ -427,11 +438,90 @@ class _Run:
         path.write_text(text, encoding="utf-8")
         return {"message": "需求摘要已保存，请确认本次目标。", "artifacts": [self.artifact(path, "需求摘要")]}
 
+    def read_library_guidance(self) -> str:
+        """Read node-relevant original methods, without executing their tools."""
+        from .workflow_skill_catalog import WorkflowSkillCatalog, WorkflowSkillCatalogError
+
+        catalog = WorkflowSkillCatalog(self.root)
+        routes = {
+            "brief": ("video-strategy", "text-condenser"),
+            "script": ("video-script", "text-polisher"),
+            "source": ("video-production", "asset-manager"),
+            "transcript": ("video-production", "auto-subtitle", "text-polisher"),
+            "storyboard": ("video-production", "video-script"),
+            "build": ("video-production", "remotion-video-production", "remotion-best-practices"),
+            "review": ("video-production", "skill-quality-gate"),
+            "deliver": ("video-production", "post-formatter"),
+            "publish": ("skill-cross-platform-publish",),
+            "archive": ("skill-publish-log", "skill-content-postmortem"),
+        }
+        if self.node == "publish" and self.project.get("kind") != "article":
+            platform = (self.project.get("settings") or {}).get("publish_platform") or "weixin-channels"
+            adapter = {"weixin-channels": "skill-channels-upload", "kuaishou": "skill-kuaishou-upload"}.get(platform)
+            if adapter:
+                routes["publish"] += (adapter,)
+        relevant_references = {
+            "video-script": ("references/retention-scripting-guide.md",),
+            "text-polisher": ("references/phrases-to-remove.md", "references/structures-to-avoid.md",
+                              "references/zh-ai-markers.md", "references/checklist.md"),
+        }
+        documents, remaining = [], 120_000
+
+        def read_document(name, path="SKILL.md"):
+            nonlocal remaining
+            page = catalog.read_skill(name, relative_path=path, node=self.node)
+            first = page
+            chunks = []
+            while True:
+                content = page["content"]
+                remaining -= len(content)
+                if remaining < 0:
+                    raise RunnerBlocked("节点 Skill 与参考指南超过读取上限，请精简后重试。")
+                chunks.append(content)
+                next_offset = page.get("next_offset")
+                if next_offset is None:
+                    break
+                if not isinstance(next_offset, int) or next_offset <= page["offset"]:
+                    raise RunnerBlocked("节点 Skill 分页位置无效，请重试。")
+                page = catalog.read_skill(name, relative_path=path, node=self.node, offset=next_offset)
+                if page["sha256"] != first["sha256"]:
+                    raise RunnerBlocked("节点 Skill 在读取过程中已变化，请重试以使用完整同一版本。")
+            label = f"{first['name']}/{first['path']}"
+            self.notify({"kind": "tool", "text": f"已读取{' Skill' if path == 'SKILL.md' else '参考指南'}：{label}（只读方法）"})
+            self.log(f"已读取节点规范：{label} sha256={first['sha256']}")
+            self.library_skills_used.append({"name": first["name"], "path": first["path"], "sha256": first["sha256"]})
+            documents.append(f"--- {label} ---\n{''.join(chunks)}")
+            return first
+
+        for name in routes[self.node]:
+            try:
+                skill = read_document(name)
+            except WorkflowSkillCatalogError as exc:
+                # Isolated projects and explicitly disabled Skills remain usable.
+                self.notify({"kind": "status", "text": f"未加载 {name}：{exc}；继续使用本节点可用规范。"})
+                continue
+            for path in relevant_references.get(name, ()):
+                if path not in skill.get("references", []):
+                    continue
+                try:
+                    read_document(name, path)
+                except WorkflowSkillCatalogError as exc:
+                    raise RunnerBlocked(f"无法完整读取 {name}/{path}：{exc}") from exc
+        if not documents:
+            return ""
+        self.notify({"kind": "status", "text": "原 Skill 已作为当前节点的内容与检查参考；实际工具仍由固定执行器调用，不代表已运行 Skill 中的全部脚本或通过全部检查。"})
+        writing = ("将 video-script 的结构方法与 text-polisher 的中文润色方法用于同一次创作。最终只输出可采用的稿件正文，"
+                   "不附评分表、执行报告或 JSON。" if self.node == "script" else "")
+        return ("\n\n以下是宿主实际读取的原有 Skill 与参考指南。项目需求、修改意见与本节点规范优先；只应用与当前节点和已支持能力"
+                "有关的内容、质量规则。原 Skill 中其他节点、可选能力和整条产线的说明不视为本项目新增需求，不据此自行增加动作或"
+                "unsupported_requests；用户本次明确要求超出能力时仍须如实说明。" + writing +
+                "指南中的脚本、额外文件读取和 API 步骤并未因读取而执行，不能声称已完成这些操作或伪造检查结果。\n\n" + "\n\n".join(documents))
+
     async def step_script(self):
         primary = self.primary()
         manuscripts = copy.deepcopy(self.project.get("manuscripts") or [])
         feedback = self.options.get("feedback") or self.options.get("notes")
-        new = not primary or self.options.get("mode") == "generate" or bool(feedback)
+        new = self.options.get("action") != "adopt" and (not primary or self.options.get("mode") == "generate" or bool(feedback))
         if self.options.get("action") == "adopt" and not primary:
             raise RunnerBlocked("请先选择有效主稿。")
         if new:

@@ -85,7 +85,14 @@ TURN_REMINDER = (
 
 def turn_reminder() -> str:
     """返回每轮行为提醒文案。"""
-    return TURN_REMINDER
+    # Windows installs may contain old copied Skills in the OpenClaw profile.
+    # Keep ordinary chat on the same editable source used by the Skill library
+    # and workflow learning; do not copy or overwrite either directory here.
+    library = PROJECT_ROOT / "skills" / "openclaw"
+    source = (f"本机 Easel 内置技能的当前源目录是 {library}；同名 Skill 在此存在时，"
+              "请读取这里的 SKILL.md 与相对 references，不要使用工作区同名旧副本。"
+              "其它外部 Skill 仍按其已注册路径读取。" if library.is_dir() else "")
+    return TURN_REMINDER + source
 
 
 def chat_turn_message(user_message: str, name: str | None) -> str:

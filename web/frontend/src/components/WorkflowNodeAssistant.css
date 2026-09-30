@@ -15,6 +15,13 @@
 .cw-chat-user-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; color: #3b5543; line-height: 1.8; }
 .cw-chat-message .cw-markdown { font-size: 13px; }
 .cw-chat-read { margin-left: auto; border: 0; background: transparent; font-size: 10px !important; color: #619279; cursor: pointer; padding: 2px; }
+.cw-chat-skill-trace { border-top: 1px dashed #dce7d7; margin-top: 14px; padding-top: 11px; }
+.cw-chat-skill-trace > strong { display: block; color: #819576; font-size: 10px; font-weight: 500; margin-bottom: 5px; }
+.cw-chat-skill-trace > div { display: flex; align-items: center; gap: 12px; }
+.cw-chat-skill-trace button { border: 0; background: transparent; padding: 5px 0; color: #547b59; cursor: pointer; text-align: left; overflow-wrap: anywhere; min-width: 0; }
+.cw-chat-skill-trace button:first-child { flex: 1; }
+.cw-chat-skill-trace button span { font-size: 11px; } .cw-chat-skill-trace button small { display: block; color: #91a182; font-size: 10px; }
+.cw-chat-skill-trace .cw-trace-learn { font-size: 10px; color: #7b946c; white-space: nowrap; }
 .cw-chat-latest { display: block; margin: -8px auto 12px; position: relative; border: 1px solid #c9dfcc; background: #f2f8f1; color: #416d51; font-size: 11px !important; border-radius: 16px; padding: 6px 15px; cursor: pointer; }
 .cw-activity { border-top: 1px solid #e7ede3; border-bottom: 1px solid #e7ede3; padding: 13px 18px; background: #f7f9f5; }
 .cw-activity-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 11px; color: #5d765f; } .cw-activity-heading strong { font-weight: 550; } .cw-activity-heading > span { font-size: 10px; color: #9aaa93; }

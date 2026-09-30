@@ -391,6 +391,9 @@ class ContentWorkflowService:
                     p["content_version"] += 1
                 n.update(status=result.get("status", "awaiting_review"), message=result.get("message", "已生成，等待确认"),
                          artifacts=result.get("artifacts", []))
+                if isinstance(result.get("library_skills_used"), list):
+                    n["library_skills_used"] = result["library_skills_used"]
+                    n["runs"][-1]["library_skills_used"] = result["library_skills_used"]
                 if result.get("publication_uncertain"):
                     n["publication_uncertain"] = True
                 n["runs"][-1].update(status=n["status"], message=safe_error(n["message"]), finished_at=now())

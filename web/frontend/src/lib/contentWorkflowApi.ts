@@ -3,8 +3,9 @@ export type WorkflowKind = 'video' | 'article';
 export type WorkflowNodeId = 'brief' | 'script' | 'source' | 'transcript' | 'storyboard' | 'build' | 'review' | 'deliver' | 'publish' | 'archive';
 export interface WorkflowArtifact { name: string; path: string; url?: string; kind?: string; }
 export interface WorkflowRun { id?: string; status?: string; message?: string; started_at?: string; finished_at?: string; log?: string; }
-export interface WorkflowFeedback { text: string; created_at?: string; at?: string; }
-export interface WorkflowChatMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'streaming' | 'completed' | 'failed' | 'stopped'; created_at: string; }
+export interface WorkflowSkillUse { name: string; path: string; sha256?: string; }
+export interface WorkflowFeedback { text: string; created_at?: string; at?: string; target_node?: WorkflowNodeId; }
+export interface WorkflowChatMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'streaming' | 'completed' | 'failed' | 'stopped'; created_at: string; skills_used?: WorkflowSkillUse[]; }
 export interface WorkflowActivity { id: string; kind: 'status' | 'generation' | 'tool' | 'result' | 'error'; text: string; at: string; run_id?: string; }
 export interface WorkflowNode {
   id: WorkflowNodeId; title: string; status: string; message?: string; version: number;
@@ -28,8 +29,11 @@ export interface WorkflowProject {
 export interface WorkflowDefinition { id: WorkflowNodeId; title: string; description?: string; skills?: string[]; }
 export interface WorkflowIndex { projects: WorkflowProject[]; nodes: WorkflowDefinition[]; defaults: { vault?: string; output_dir?: string; [key: string]: unknown }; }
 export interface WorkflowSkill { name?: string; path?: string; content?: string; body?: string; version?: string; }
-export interface WorkflowSkills { version?: string; content?: string; body?: string; target_path?: string; skills?: (WorkflowSkill | string)[]; [key: string]: unknown; }
-export interface LearningProposal { proposal_id: string; before: string; after: string; diff: string | string[]; base_version: string; target_path?: string; after_version?: string; [key: string]: unknown; }
+export interface WorkflowLibrarySkill { id: string; name: string; description?: string; layer?: string; stages?: WorkflowNodeId[]; requires_tools?: boolean; capability?: string; execution_note?: string; }
+export interface WorkflowLibrarySource { name: string; path: string; content: string; sha256: string; version: string; target_path?: string; references?: string[]; truncated?: boolean; next_offset?: number | null; }
+export interface WorkflowSkills { version?: string; content?: string; body?: string; target_path?: string; skills?: (WorkflowSkill | string)[]; library?: WorkflowLibrarySkill[]; used_skills?: WorkflowSkillUse[]; library_error?: string; [key: string]: unknown; }
+export type WorkflowLearningScope = 'node' | 'library';
+export interface LearningProposal { proposal_id: string; before: string; after: string; diff: string | string[]; base_version: string; target_path?: string; after_version?: string; scope?: WorkflowLearningScope; skill_name?: string; relative_path?: string; [key: string]: unknown; }
 export interface ArchivePreview { status?: string; target_path?: string; path?: string; content?: string; markdown?: string; hash?: string; expected_hash?: string; targets?: { path: string; action: string; before_hash?: string; after_hash?: string }[]; plan?: { note_path?: string; primary_manuscript_id?: string; status?: string; publication_status?: string }; files?: unknown[]; [key: string]: unknown; }
 export interface ObsidianNote { title: string; path: string; excerpt?: string; }
 
@@ -63,8 +67,9 @@ export const stopWorkflowNode = async (id: string, node: WorkflowNodeId) => unpa
 export const sendWorkflowChat = async (id: string, node: WorkflowNodeId, message: string, content_version: number, client_message_id: string) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, node)}/chat`, 'POST', { message, content_version, client_message_id }));
 export const reconcileWorkflowPublish = async (id: string, note: string) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, 'publish')}/reconcile`, 'POST', { outcome: 'not_submitted', confirm: true, note }));
 export const fetchWorkflowSkills = (id: string, node: WorkflowNodeId) => request<WorkflowSkills>(`${nodeUrl(id, node)}/skills`);
-export const previewWorkflowLearning = (id: string, node: WorkflowNodeId, instruction: string, expected_version?: string) => request<LearningProposal>(`${nodeUrl(id, node)}/learn/preview`, 'POST', { instruction, scope: 'node', expected_version });
-export const applyWorkflowLearning = (id: string, node: WorkflowNodeId, proposal_id: string) => request<Record<string, unknown>>(`${nodeUrl(id, node)}/learn/apply`, 'POST', { proposal_id });
+export const fetchWorkflowLibrarySkill = (id: string, node: WorkflowNodeId, name: string, path = 'SKILL.md') => request<WorkflowLibrarySource>(`${nodeUrl(id, node)}/skills/library?name=${encodeURIComponent(name)}&path=${encodeURIComponent(path)}`);
+export const previewWorkflowLearning = (id: string, node: WorkflowNodeId, instruction: string, expected_version?: string, target?: { scope: WorkflowLearningScope; skill_name?: string; relative_path?: string }) => request<LearningProposal>(`${nodeUrl(id, node)}/learn/preview`, 'POST', { instruction, scope: 'node', expected_version, ...target });
+export const applyWorkflowLearning = (id: string, node: WorkflowNodeId, proposal_id: string, scope: WorkflowLearningScope = 'node') => request<Record<string, unknown>>(`${nodeUrl(id, node)}/learn/apply`, 'POST', { proposal_id, scope });
 export const workflowSkillExportUrl = (id: string, node: WorkflowNodeId) => `${base}${nodeUrl(id, node)}/skills/export`;
 export const workflowAllSkillsExportUrl = (id: string) => `${base}${projectUrl(id)}/skills/export`;
 export const previewWorkflowArchive = (id: string) => request<ArchivePreview>(`${projectUrl(id)}/archive/preview`);

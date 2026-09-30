@@ -38,6 +38,7 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from easel.openclaw_cmd import openclaw_base_cmd
+from easel.openclaw_tool_activity import OpenClawToolActivity
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 try:
@@ -115,10 +116,15 @@ class _GatewayHttpProc:
         return 0 if self._done else None
 
     def terminate(self) -> None:
-        self._done = True
-        if self._task is not None:
+        if self._task is None or self._task.done():
+            self.finish()
+        else:
+            # Closing the HTTP response can await cleanup. Keep the session
+            # registered until it actually finishes, including pre-start cancel.
+            self._task.add_done_callback(lambda _: self.finish())
             try:
-                self._task.cancel()
+                if not self._task.cancelling():
+                    self._task.cancel()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1942,8 +1948,11 @@ _BG_TASKS: set = set()
 
 # 正在跑的对话 openclaw 进程（sk→proc），供用户**显式「停止」**终止；断线**不**经此路径（断线不杀）。
 _RUNNING_CHAT: dict = {}
+_RUNNING_CHAT_TURNS: dict[str, str] = {}
+_WORKFLOW_AGENT_TURNS: dict[str, str] = {}
 # 被用户显式停止的会话 key：supervisor 据此把本轮当作正常「已停止」收尾（不报「被中断」、释放会话锁）。
 _STOPPED_CHAT: set = set()
+_WORKFLOW_STOP_REQUESTS: set[tuple[str, str]] = set()
 
 
 @app.get("/api/chat/last/{session_id}")
@@ -2179,6 +2188,18 @@ async def api_chat_stream(req: ChatRequest):
         # _resolve_transport 里既有 stat 又有阻塞 urllib 探针（最多 3s），必须丢线程：
         # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
         is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
+        # Checkpoint only after owning the session locks, before this turn starts.
+        # Current OpenClaw records actual tools in SQLite, not its raw text stream.
+        tool_activity = await asyncio.to_thread(
+            OpenClawToolActivity, f"agent:main:{sk}", PROJECT_ROOT)
+        if (sk, turn_id) in _WORKFLOW_STOP_REQUESTS:
+            _WORKFLOW_STOP_REQUESTS.discard((sk, turn_id))
+            xlock.release()
+            lock.release()
+            _save_turn(pk, "done", "", {"turn_id": turn_id, "clean_end": False, "stop_reason": "user_stopped"})
+            to_client("done", sessionKey=sk)
+            client_q.put_nowait(CLIENT_DONE)
+            return
         if is_http:
             # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
             proc = _GatewayHttpProc()
@@ -2200,6 +2221,7 @@ async def api_chat_stream(req: ChatRequest):
                 client_q.put_nowait(CLIENT_DONE)
                 return
         _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
+        _RUNNING_CHAT_TURNS[sk] = turn_id
         # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
         # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
         to_client("activity", "🧠 正在思考…")
@@ -2237,6 +2259,11 @@ async def api_chat_stream(req: ChatRequest):
         # 早一步 create_task 就只能靠「中间没有 await」来侥幸，改一行同步代码就会崩。
         if is_http:
             proc._task = loop.create_task(_run_gateway_turn(proc))
+
+        # Public metadata only: no thinking, tool outputs, commands or credentials.
+        # Send directly to the client queue, so a final SSE sentinel cannot drop it.
+        tool_activity_task = loop.create_task(tool_activity.relay(
+            lambda: proc.poll() is None, lambda text: to_client("activity", text)))
 
         # ---- ask_user 问答题桥接：轮询 gateway 的 pending question，推给前端渲染 ----
         # 背景：OpenClaw 的 ask_user 注册到 gateway 进程内，Easel 前端不消费 question RPC → 选项不可见。
@@ -2495,6 +2522,11 @@ async def api_chat_stream(req: ChatRequest):
                         await asyncio.to_thread(proc.wait, timeout=2)
                     except (OSError, subprocess.TimeoutExpired):
                         pass
+            # Keep the session lock until the final tool result is forwarded.
+            try:
+                await asyncio.wait_for(tool_activity_task, timeout=2)
+            except (Exception, asyncio.CancelledError):
+                tool_activity_task.cancel()
             # 诊断日志：每次对话流收尾都记一行，供事后定位「莫名停下」到底是哪种情况。
             try:
                 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2527,6 +2559,8 @@ async def api_chat_stream(req: ChatRequest):
             xlock.release()
             lock.release()
             _RUNNING_CHAT.pop(sk, None)
+            if _RUNNING_CHAT_TURNS.get(sk) == turn_id:
+                _RUNNING_CHAT_TURNS.pop(sk, None)
             to_client("done", sessionKey=sk)
             client_q.put_nowait(CLIENT_DONE)
 
@@ -2643,6 +2677,7 @@ async def api_question_status(req: QuestionStatusRequest):
 
 class StopRequest(BaseModel):
     sessionId: str | None = None
+    turnId: str | None = None
 
 
 @app.post("/api/chat/stop")
@@ -2650,6 +2685,8 @@ async def api_chat_stop(req: StopRequest):
     """用户显式停止当前会话正在跑的对话 agent：终止进程 → supervisor 收尾释放会话锁 →
     下一句立刻能发（不再卡「上一条还在跑」）。仅此显式入口会杀进程；客户端断线不经此路径。"""
     sk = (req.sessionId or "").strip()
+    if req.turnId and _RUNNING_CHAT_TURNS.get(sk) != req.turnId:
+        return {"stopped": False}
     proc = _RUNNING_CHAT.get(sk) if sk else None
     if proc is not None and proc.poll() is None:
         _STOPPED_CHAT.add(sk)          # 标记为用户停止，供 supervisor 正常收尾（不报「被中断」）
@@ -2671,6 +2708,30 @@ async def api_chat_stop(req: StopRequest):
             await asyncio.sleep(0.05)
         return {"stopped": True}
     return {"stopped": False}          # 没有在跑（可能已结束）→ 前端照常清理即可
+
+
+# Workflow execution reuses the exact original chat supervisor, tool runtime and
+# event stream. Dedicated session IDs keep it separate from ordinary chats.
+async def _workflow_agent_start(*, message: str, session_id: str, turn_id: str):
+    _WORKFLOW_AGENT_TURNS[session_id] = turn_id
+    return await api_chat_stream(ChatRequest(message=message, sessionId=session_id, turnId=turn_id))
+
+
+async def _workflow_agent_stop(*, session_id: str, turn_id: str):
+    # An old cancellation must never terminate a newer run in the same node.
+    if _WORKFLOW_AGENT_TURNS.get(session_id) != turn_id:
+        return {"stopped": False}
+    _WORKFLOW_STOP_REQUESTS.add((session_id, turn_id))
+    result = await api_chat_stop(StopRequest(sessionId=session_id, turnId=turn_id))
+    snapshot = await api_chat_last(session_id)
+    if result.get("stopped") or (snapshot.get("status") == "done" and snapshot.get("turn_id") == turn_id):
+        _WORKFLOW_STOP_REQUESTS.discard((session_id, turn_id))
+    return result
+
+
+from easel.workflow_skill_agent import WorkflowSkillAgent
+content_workflow_service.skill_agent = WorkflowSkillAgent(
+    _workflow_agent_start, _workflow_agent_stop, project_root=PROJECT_ROOT)
 
 
 @app.post("/api/chat")

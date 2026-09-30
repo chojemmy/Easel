@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { WorkflowActivity, WorkflowNode, WorkflowNodeId } from '../lib/contentWorkflowApi';
+import type { WorkflowActivity, WorkflowNode, WorkflowNodeId, WorkflowSkillUse } from '../lib/contentWorkflowApi';
 import SafeMarkdown from './SafeMarkdown';
 import { IconSkills, IconStop } from './icons';
 import './WorkflowNodeAssistant.css';
@@ -34,9 +34,11 @@ interface Props {
   onSend: (message: string, clientMessageId: string) => Promise<boolean>;
   onStop: () => Promise<void>;
   onRead: (title: string, content: string) => void;
+  onReadSkill: (skill: WorkflowSkillUse) => void;
+  onLearnSkill: (skill: WorkflowSkillUse) => void;
 }
 
-export default function WorkflowNodeAssistant({ projectId, node, disabled, submitting, executing, budget, onBudget, onSend, onStop, onRead }: Props) {
+export default function WorkflowNodeAssistant({ projectId, node, disabled, submitting, executing, budget, onBudget, onSend, onStop, onRead, onReadSkill, onLearnSkill }: Props) {
   const context = `${projectId}:${node.id}`;
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [showLatest, setShowLatest] = useState(false);
@@ -61,7 +63,7 @@ export default function WorkflowNodeAssistant({ projectId, node, disabled, submi
     if (!panel) return;
     if (followBottom.current) { panel.scrollTop = panel.scrollHeight; setShowLatest(false); }
     else setShowLatest(true);
-  }, [context, messages.length, lastMessage?.id, lastMessage?.content, lastMessage?.status]);
+  }, [context, messages.length, lastMessage?.id, lastMessage?.content, lastMessage?.status, lastMessage?.skills_used?.length]);
   useEffect(() => {
     if (node.chat?.status !== 'failed' || !lastMessage || restored.current.has(`${context}:${lastMessage.id}`)) return;
     const user = messages.filter((message) => message.role === 'user').at(-1);
@@ -88,7 +90,7 @@ export default function WorkflowNodeAssistant({ projectId, node, disabled, submi
   return <section className="cw-assistant" aria-label="节点助手">
     <header className="cw-assistant-heading"><div><span className="cw-assistant-icon"><IconSkills size={20} /></span><div><h3>节点助手</h3><p>围绕“{node.title}”补充要求、生成内容和处理问题</p></div></div><span className={`cw-assistant-state ${chatRunning ? 'is-live' : ''}`} role="status">{chatRunning ? '正在处理' : node.chat?.status === 'failed' ? '上次处理未完成' : node.chat?.status === 'stopped' ? '已停止' : '随时补充要求'}</span></header>
     <div className="cw-chat-thread" ref={thread} role="log" aria-label={`${node.title}对话`} onScroll={() => { const panel = thread.current; if (panel) { followBottom.current = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 55; if (followBottom.current) setShowLatest(false); } }}>
-      {messages.length ? messages.map((message) => <article key={message.id} className={`cw-chat-message cw-chat-${message.role}`}><div className="cw-chat-meta"><strong>{message.role === 'user' ? '你' : '节点助手'}</strong><span>{time(message.created_at)}</span>{message.status === 'streaming' && <span className="cw-chat-streaming">正在生成</span>}{message.status === 'failed' && <span>未完成</span>}{message.status === 'stopped' && <span>已停止</span>}{message.role === 'assistant' && message.content && <button className="cw-chat-read" onClick={() => onRead(`${node.title} · 助手答复`, message.content)}>展开阅读</button>}</div>{message.role === 'assistant' ? <SafeMarkdown content={message.content || (message.status === 'streaming' ? '正在准备回复…' : '此次没有生成正文。')} /> : <p className="cw-chat-user-text">{message.content}</p>}</article>) : <div className="cw-chat-empty"><strong>在这里和助手一起完成本节点</strong><p>{PROMPTS[node.id]}</p><small>对话和处理结果会保留在当前项目。</small></div>}
+      {messages.length ? messages.map((message) => <article key={message.id} className={`cw-chat-message cw-chat-${message.role}`}><div className="cw-chat-meta"><strong>{message.role === 'user' ? '你' : '节点助手'}</strong><span>{time(message.created_at)}</span>{message.status === 'streaming' && <span className="cw-chat-streaming">正在生成</span>}{message.status === 'failed' && <span>未完成</span>}{message.status === 'stopped' && <span>已停止</span>}{message.role === 'assistant' && message.content && <button className="cw-chat-read" onClick={() => onRead(`${node.title} · 助手答复`, message.content)}>展开阅读</button>}</div>{message.role === 'assistant' ? <SafeMarkdown content={message.content || (message.status === 'streaming' ? '正在准备回复…' : '此次没有生成正文。')} /> : <p className="cw-chat-user-text">{message.content}</p>}{message.role === 'assistant' && !!message.skills_used?.length && <div className="cw-chat-skill-trace"><strong>本轮已读取的原有 Skill</strong>{Array.from(new Map(message.skills_used.map((item) => [`${item.name}:${item.path}`, item])).values()).map((item) => <div key={`${item.name}:${item.path}`}><button disabled={submitting} onClick={() => onReadSkill(item)}><span>{item.name}</span><small>{item.path}</small></button><button className="cw-trace-learn" disabled={submitting} onClick={() => onLearnSkill(item)}>沉淀经验</button></div>)}</div>}</article>) : <div className="cw-chat-empty"><strong>在这里和助手一起完成本节点</strong><p>{PROMPTS[node.id]}</p><small>对话和处理结果会保留在当前项目。</small></div>}
     </div>
     {showLatest && <button className="cw-chat-latest" onClick={() => { followBottom.current = true; if (thread.current) thread.current.scrollTop = thread.current.scrollHeight; setShowLatest(false); }}>查看最新回复 ↓</button>}
     <div className="cw-activity" aria-label="执行动态"><div className="cw-activity-heading"><strong>执行动态</strong><span>{executing ? '实时更新中' : '本节点最近记录'}</span>{executing && <button className="cw-chat-stop" disabled={submitting} onClick={() => void onStop()}><IconStop size={12} />停止</button>}</div>
