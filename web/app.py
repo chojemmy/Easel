@@ -38,7 +38,7 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from easel.openclaw_cmd import openclaw_base_cmd
-from easel.openclaw_tool_activity import OpenClawToolActivity
+from easel.openclaw_live_activity import OpenClawLiveToolActivity
 from easel.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 try:
@@ -2104,6 +2104,7 @@ async def api_chat_stream(req: ChatRequest):
                                 d = json.loads(payload)
                             except ValueError:
                                 continue
+                            tool_activity.bind_run(d.get("id"))
                             if isinstance(d.get("error"), dict):   # 200 里夹错误对象：不能当正常流吞掉
                                 to_client("error", f"❌ 网关返回错误：{str(d['error'])[:160]}")
                                 return
@@ -2189,11 +2190,13 @@ async def api_chat_stream(req: ChatRequest):
         # 直接在协程里调会把整个事件循环——连同其它会话正在推的 SSE——一起卡住。
         is_http = (await asyncio.to_thread(_resolve_transport, sk)) == "http"
         # Checkpoint only after owning the session locks, before this turn starts.
-        # Current OpenClaw records actual tools in SQLite, not its raw text stream.
+        # Subscribe to live tool events before launching; SQLite is only fallback.
         tool_activity = await asyncio.to_thread(
-            OpenClawToolActivity, f"agent:main:{sk}", PROJECT_ROOT)
+            OpenClawLiveToolActivity, f"agent:main:{sk}", PROJECT_ROOT,
+            allow_lifecycle_binding=not is_http)
         if (sk, turn_id) in _WORKFLOW_STOP_REQUESTS:
             _WORKFLOW_STOP_REQUESTS.discard((sk, turn_id))
+            await asyncio.to_thread(tool_activity.close)
             xlock.release()
             lock.release()
             _save_turn(pk, "done", "", {"turn_id": turn_id, "clean_end": False, "stop_reason": "user_stopped"})
@@ -2211,6 +2214,7 @@ async def api_chat_stream(req: ChatRequest):
                     bufsize=1, env=env,
                 )
             except BaseException:
+                await asyncio.to_thread(tool_activity.close)
                 lock.release()
                 xlock.release()
                 _save_turn(pk, "done", "❌ 启动失败，请重试", {

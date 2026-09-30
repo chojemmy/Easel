@@ -78,7 +78,7 @@ Easel 左侧的“内容工作流”把一个视频或一篇文章保存为一�
 
 模型正文通过真实 SSE 文本增量展示；工具开始、完成、取消、失败进入执行动态。显示的是生成内容和可观察的执行状态，不是模型内部推理。刷新或切换页面不会停止后台任务；停止按钮会阻止迟到结果覆盖内容。文档、主稿、标准和归档正文在页内阅读器排版展示，Markdown HTML 经消毒且不自动加载外部图片。
 
-当前 OpenClaw 的原文字流不包含内置工具事件，因此 `openclaw_tool_activity.py` 只读当前会话的 SQLite 工具元数据：工具名、Skill/产物路径与开始/结束状态。不会提取内部推理、命令参数或工具输出，也不会重放旧轮次；网关版本不提供该记录时明确提示未取得执行细节。
+当前 OpenClaw 的原文字流不包含内置工具事件。`openclaw_live_activity.py` 在启动任务前通过现有 Gateway WebSocket 完成订阅，按当前会话、本轮 run ID 和事件序号显示真实工具开始/结束状态。只展示工具名及 Skill/产物路径，不展示内部推理、命令参数或工具正文。当前本地 OpenClaw 的 SQLite 轨迹在整轮收尾时才落库，因此 `openclaw_tool_activity.py` 仅作断线后的记录补全，明确标注“执行记录补全”并与实时事件去重，不把结束后的记录回放称为实时。无法取得细节时会明确提示。
 
 默认读取本机 OpenClaw 的 MiniMax 模型配置，凭证仅取环境变量。可用 `EASEL_WORKFLOW_MODEL`、`EASEL_WORKFLOW_BASE_URL`、`EASEL_WORKFLOW_API` 和 `EASEL_WORKFLOW_KEY` 配置独立模型；跨服务改地址需要显式提供对应 Key。Windows 使用既有受保护服务启动器，使密钥只进入进程环境。
 

@@ -27,6 +27,7 @@ class OpenClawToolActivity:
         self.available = False
         self.seen = set()
         self.labels = {}
+        self.expected_run_id = None
         try:
             with self._connect() as connection:
                 self.session_id = self._session(connection)
@@ -122,24 +123,29 @@ class OpenClawToolActivity:
             return []
         output = []
         for _, run_id, kind, key, call_id, name, path, success in rows:
-            if key not in (None, self.session_key) or not isinstance(call_id, str) or not isinstance(name, str):
+            if key not in (None, self.session_key) or self.expected_run_id is not None and run_id != self.expected_run_id:
                 continue
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
-                continue
-            identity = (session, run_id, call_id)
-            marker = (*identity, kind)
-            if marker in self.seen:
-                continue
-            self.seen.add(marker)
-            if kind == "tool.call":
-                label = self._path_label(path) if name in {"read", "write", "edit", "read_file", "write_file"} else ""
-                self.labels[identity] = label
-                output.append(f"工具开始：{name}" + (f" · {label}" if label else ""))
-            else:
-                label = self.labels.get(identity, "")
-                state = "完成" if success is True or success == 1 else "失败" if success is False or success == 0 else "返回（状态未标明）"
-                output.append(f"工具{state}：{name}" + (f" · {label}" if label else ""))
+            output.extend(self.render_metadata(run_id, kind, call_id, name, path, success))
         return output
+
+    def render_metadata(self, run_id, kind, call_id, name, path=None, success=None):
+        """Share public formatting/deduplication with the live WebSocket adapter."""
+        if kind not in {"tool.call", "tool.result"} or not isinstance(call_id, str) or not isinstance(name, str):
+            return []
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
+            return []
+        identity = (run_id, call_id)
+        marker = (*identity, kind)
+        if marker in self.seen:
+            return []
+        self.seen.add(marker)
+        if kind == "tool.call":
+            label = self._path_label(path) if name in {"read", "write", "edit", "read_file", "write_file"} else ""
+            self.labels[identity] = label
+            return [f"工具开始：{name}" + (f" · {label}" if label else "")]
+        label = self.labels.get(identity, "")
+        state = "完成" if success is True or success == 1 else "失败" if success is False or success == 0 else "返回（状态未标明）"
+        return [f"工具{state}：{name}" + (f" · {label}" if label else "")]
 
     async def relay(self, is_running, emit, *, interval: float = .25):
         """Forward public metadata and drain the last committed events on exit."""
