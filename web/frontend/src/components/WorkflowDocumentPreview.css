@@ -1,0 +1,30 @@
+.cw-markdown.cw-markdown { line-height: 1.85; color: #283b32; overflow-wrap: anywhere; font-size: 14px; }
+.cw-markdown.cw-markdown > :first-child { margin-top: 0; }
+.cw-markdown.cw-markdown > :last-child { margin-bottom: 0; }
+.cw-markdown.cw-markdown h1, .cw-markdown.cw-markdown h2, .cw-markdown.cw-markdown h3, .cw-markdown.cw-markdown h4, .cw-markdown.cw-markdown h5, .cw-markdown.cw-markdown h6 { color: #223b30; font-weight: 650; line-height: 1.5; margin: 1.3em 0 .65em; letter-spacing: 0; }
+.cw-markdown.cw-markdown h1 { font-size: 1.8em; } .cw-markdown.cw-markdown h2 { font-size: 1.45em; } .cw-markdown.cw-markdown h3 { font-size: 1.2em; }
+.cw-markdown.cw-markdown p { margin: .8em 0; } .cw-markdown.cw-markdown ul, .cw-markdown.cw-markdown ol { padding-left: 1.6em; margin: .8em 0; }
+.cw-markdown.cw-markdown li + li { margin-top: .3em; } .cw-markdown.cw-markdown li p { margin: .35em 0; }
+.cw-markdown.cw-markdown blockquote { border-left: 3px solid #9bbba7; background: #f3f7f2; padding: .6em 1.1em; margin: 1em 0; color: #66796c; }
+.cw-markdown.cw-markdown a { color: #2b7260; text-decoration: underline; text-underline-offset: 3px; }
+.cw-markdown.cw-markdown a:not([href]) { color: inherit; text-decoration: none; }
+.cw-markdown.cw-markdown code { font-family: Consolas, monospace; font-size: .88em; background: #eef2ee; border-radius: 4px; padding: .12em .35em; }
+.cw-markdown.cw-markdown pre { background: #f0f4f0; border: 1px solid #e1e8e0; padding: 16px; border-radius: 8px; overflow: auto; margin: 1em 0; line-height: 1.65; }
+.cw-markdown.cw-markdown pre code { background: transparent; padding: 0; white-space: pre; }
+.cw-markdown.cw-markdown table { width: 100%; border-collapse: collapse; display: block; overflow: auto; margin: 1em 0; font-size: .93em; }
+.cw-markdown.cw-markdown th, .cw-markdown.cw-markdown td { border: 1px solid #dfe7df; padding: 9px 13px; text-align: left; min-width: 80px; }
+.cw-markdown.cw-markdown th { background: #eff5ef; } .cw-markdown.cw-markdown hr { border: 0; border-top: 1px solid #dfe7df; margin: 1.6em 0; }
+.cw-reader-backdrop { position: fixed; z-index: 1100; inset: 0; background: #172b245c; backdrop-filter: blur(4px); display: flex; justify-content: center; align-items: center; padding: 28px; }
+.cw-reader { width: min(940px, 100%); max-height: min(92vh, 1200px); display: flex; flex-direction: column; background: #fff; border: 1px solid #dbe5da; border-radius: 16px; box-shadow: 0 24px 80px #17251e38; overflow: hidden; color: #2b3b32; outline: none; }
+.cw-reader-header { display: flex; justify-content: space-between; gap: 24px; padding: 25px 32px 20px; border-bottom: 1px solid #e4ebe3; }
+.cw-reader-header > div { min-width: 0; } .cw-reader-header span { color: #779381; letter-spacing: 2px; font-size: 11px; }
+.cw-reader-header h2 { margin: 7px 0; font-size: 22px; line-height: 1.5; overflow-wrap: anywhere; }
+.cw-reader-header p { margin: 5px 0 0; color: #869389; font-size: 11px; overflow-wrap: anywhere; }
+.cw-reader-close { flex-shrink: 0; align-self: flex-start; border: 1px solid #e0e8df; background: #f5f8f3; border-radius: 8px; color: #567264; height: 35px; width: 35px; cursor: pointer; font-size: 24px; }
+.cw-reader-body { overflow: auto; min-height: 160px; padding: 30px clamp(22px, 4vw, 58px) 45px; overscroll-behavior: contain; }
+.cw-reader-code { white-space: pre-wrap; overflow-wrap: anywhere; font-family: Consolas, monospace; font-size: 12px; line-height: 1.85; margin: 0; }
+.cw-reader-error { color: #a74332; background: #fff3ef; padding: 15px; border-radius: 8px; }
+.cw-reader-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 14px 30px; border-top: 1px solid #e4ebe3; font-size: 11px; color: #829284; }
+.cw-reader-footer a { color: #2c7057; }
+.cw-reader :focus-visible { outline: 3px solid #a2c6b8; outline-offset: 2px; }
+@media (max-width: 640px) { .cw-reader-backdrop { padding: 10px; } .cw-reader { max-height: 96dvh; border-radius: 12px; } .cw-reader-header { padding: 18px; gap: 12px; } .cw-reader-header h2 { font-size: 18px; } .cw-reader-body { padding: 22px 18px 32px; } .cw-reader-footer { padding: 12px 18px; } }

@@ -4,11 +4,15 @@ export type WorkflowNodeId = 'brief' | 'script' | 'source' | 'transcript' | 'sto
 export interface WorkflowArtifact { name: string; path: string; url?: string; kind?: string; }
 export interface WorkflowRun { id?: string; status?: string; message?: string; started_at?: string; finished_at?: string; log?: string; }
 export interface WorkflowFeedback { text: string; created_at?: string; at?: string; }
+export interface WorkflowChatMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'streaming' | 'completed' | 'failed' | 'stopped'; created_at: string; }
+export interface WorkflowActivity { id: string; kind: 'status' | 'generation' | 'tool' | 'result' | 'error'; text: string; at: string; run_id?: string; }
 export interface WorkflowNode {
   id: WorkflowNodeId; title: string; status: string; message?: string; version: number;
   approved_version?: number; artifacts: WorkflowArtifact[]; runs: WorkflowRun[];
   feedback: WorkflowFeedback[]; skill_version?: string; current_skill_version?: string; skill_updated?: boolean; skill_error?: string;
   publication_uncertain?: boolean; progress?: number; updated_at?: string;
+  chat?: { status: 'idle' | 'running' | 'failed' | 'stopped'; messages: WorkflowChatMessage[]; error?: string; [key: string]: unknown };
+  activity?: WorkflowActivity[];
 }
 export interface WorkflowManuscript {
   id: string; title: string; content: string; source_kind: 'manual' | 'obsidian' | 'generated' | 'file';
@@ -56,6 +60,7 @@ export const runWorkflowNode = async (id: string, node: WorkflowNodeId, data: Re
 export const approveWorkflowNode = async (id: string, node: WorkflowNodeId, version: number) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, node)}/approve`, 'POST', { version }));
 export const sendWorkflowFeedback = async (id: string, node: WorkflowNodeId, text: string, target_node?: WorkflowNodeId) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, node)}/feedback`, 'POST', { text, target_node }));
 export const stopWorkflowNode = async (id: string, node: WorkflowNodeId) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, node)}/stop`, 'POST', {}));
+export const sendWorkflowChat = async (id: string, node: WorkflowNodeId, message: string, content_version: number, client_message_id: string) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, node)}/chat`, 'POST', { message, content_version, client_message_id }));
 export const reconcileWorkflowPublish = async (id: string, note: string) => unpack(await request<WorkflowProject | { project: WorkflowProject }>(`${nodeUrl(id, 'publish')}/reconcile`, 'POST', { outcome: 'not_submitted', confirm: true, note }));
 export const fetchWorkflowSkills = (id: string, node: WorkflowNodeId) => request<WorkflowSkills>(`${nodeUrl(id, node)}/skills`);
 export const previewWorkflowLearning = (id: string, node: WorkflowNodeId, instruction: string, expected_version?: string) => request<LearningProposal>(`${nodeUrl(id, node)}/learn/preview`, 'POST', { instruction, scope: 'node', expected_version });

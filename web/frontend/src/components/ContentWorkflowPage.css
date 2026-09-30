@@ -6,6 +6,12 @@
 .cw-page .btn { min-height: 35px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 12px; white-space: nowrap; }
 .cw-page .btn-primary { background: #2e6553; border-color: #2e6553; color: white; box-shadow: none; }
 .cw-page .btn-primary:hover:not(:disabled) { background: #255441; border-color: #255441; }
+.cw-read-button { border: 0; background: transparent; padding: 3px 0; cursor: pointer; font-size: 11px !important; }
+.cw-manuscript-read { margin: 7px 0 11px; }
+.cw-archive-read { margin-top: 13px; }
+.cw-archive-markdown { max-height: 450px; overflow: auto; padding: 18px; margin: 15px 0; background: #f8faf5; border-radius: 8px; }
+.cw-standard-preview { max-height: 260px; overflow: auto; margin-top: 13px; }
+.cw-standard-preview .cw-markdown { font-size: 11px; }
 .cw-page h1, .cw-page h2, .cw-page h3, .cw-page h4, .cw-page p { margin: 0; }
 .cw-page h1 { font-size: 28px; font-weight: 650; letter-spacing: -.7px; line-height: 1.4; }
 .cw-page h2 { font-size: 19px; font-weight: 650; line-height: 1.4; }
