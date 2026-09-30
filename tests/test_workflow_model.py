@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import json
 from pathlib import Path
 import sys
@@ -468,3 +470,178 @@ def test_openai_done_without_finish_reason_cannot_fake_success(config, monkeypat
     events = [{"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}, "[DONE]"]
     with pytest.raises(WorkflowModelError):
         run(WorkflowModel(config, client_factory=factory(lambda request: httpx.Response(200, stream=EventStream(events)))), on_text=lambda text: None)
+
+
+@pytest.mark.parametrize("status", [429, 529, 502, 503, 504])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_transient_http_retries_before_generation_without_replaying_text(config, monkeypatch, status, streaming):
+    requests, pauses, notices, text = [], [], [], []
+    rejected = httpx.Response(status, headers={"retry-after": "0"}, text="test-credential-not-real")
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return rejected
+        if streaming:
+            return httpx.Response(200, stream=EventStream(anthropic_text_events(["一次正文"])))
+        return httpx.Response(200, json={"content": [{"type": "text", "text": "一次正文"}]})
+
+    model = WorkflowModel(config, client_factory=factory(handler))
+
+    async def pause(delay):
+        assert rejected.is_closed
+        pauses.append(delay)
+
+    monkeypatch.setattr(model, "_retry_pause", pause)
+    answer = run(model, on_text=text.append if streaming else None, on_status=notices.append)
+    assert answer == "一次正文"
+    assert requests[0] == requests[1] and len(requests) == 2
+    assert pauses == [0]
+    assert len(notices) == 1 and f"HTTP {status}" in notices[0]
+    assert "test-credential-not-real" not in "".join(notices)
+    assert "".join(text) == (answer if streaming else "")
+
+
+def test_persistent_overload_has_two_retries_with_backoff_and_clear_final_error(config, monkeypatch):
+    calls, pauses, notices = [], [], []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(529, text="provider-private-detail")
+
+    model = WorkflowModel(config, client_factory=factory(handler))
+
+    async def pause(delay):
+        pauses.append(delay)
+
+    monkeypatch.setattr(model, "_retry_pause", pause)
+    with pytest.raises(WorkflowModelError, match="已停止自动重试") as error:
+        run(model, on_status=notices.append)
+    assert len(calls) == 3 and pauses == [2, 4]
+    assert len(notices) == 2
+    assert "provider-private-detail" not in str(error.value)
+
+
+@pytest.mark.parametrize("retry_after,expected", [("1.5", 1.5), ("invalid-secret-value", 2), ("nan", 2), ("-1", 2)])
+def test_retry_after_numeric_or_invalid_header(config, monkeypatch, retry_after, expected):
+    count, pauses = 0, []
+
+    def handler(request):
+        nonlocal count
+        count += 1
+        return httpx.Response(429, headers={"retry-after": retry_after}) if count == 1 else httpx.Response(200, json={"content": [{"type": "text", "text": "done"}]})
+
+    model = WorkflowModel(config, client_factory=factory(handler))
+
+    async def pause(delay):
+        pauses.append(delay)
+
+    monkeypatch.setattr(model, "_retry_pause", pause)
+    assert run(model) == "done"
+    assert pauses == [expected]
+
+
+def test_retry_after_http_date_is_respected(config, monkeypatch):
+    count, pauses = 0, []
+    retry_date = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+
+    def handler(request):
+        nonlocal count
+        count += 1
+        return httpx.Response(503, headers={"retry-after": retry_date}) if count == 1 else httpx.Response(200, json={"content": [{"type": "text", "text": "done"}]})
+
+    model = WorkflowModel(config, client_factory=factory(handler))
+
+    async def pause(delay):
+        pauses.append(delay)
+
+    monkeypatch.setattr(model, "_retry_pause", pause)
+    assert run(model) == "done"
+    assert len(pauses) == 1 and 25 < pauses[0] <= 30
+
+
+@pytest.mark.parametrize("header,timeout", [("61", 1200), ("1", 0.05)])
+def test_retry_never_ignores_server_wait_or_exceeds_total_budget(config, header, timeout):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"retry-after": header})
+
+    with pytest.raises(WorkflowModelError, match="等待超过"):
+        run(WorkflowModel(config, timeout=timeout, client_factory=factory(handler)))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("cancel_mode", ["event", "task"])
+def test_retry_backoff_is_immediately_cancellable(config, cancel_mode):
+    async def scenario():
+        waiting, cancel = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(529)
+
+        model = WorkflowModel(config, client_factory=factory(handler))
+        task = asyncio.create_task(model.generate("prompt", cancel=cancel, on_status=lambda text: waiting.set()))
+        await asyncio.wait_for(waiting.wait(), 1)
+        if cancel_mode == "event":
+            cancel.set()
+        else:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 0.5)
+        assert len(calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_retry_does_not_reset_original_deadline(config):
+    async def scenario():
+        calls = 0
+        cancelled = asyncio.Event()
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(503, headers={"retry-after": "0.01"})
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        model = WorkflowModel(config, timeout=0.05, client_factory=factory(handler))
+        with pytest.raises(WorkflowModelError, match="超时"):
+            await asyncio.wait_for(model.generate("prompt"), 0.5)
+        assert calls == 2 and cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_partial_stream_overload_is_not_automatically_replayed(config):
+    calls, pieces = [], []
+    events = anthropic_text_events(["已展示的正文"])[0:3] + [{"type": "error", "error": {"type": "overloaded_error", "message": "HTTP 529 test-credential-not-real"}}]
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, stream=EventStream(events))
+
+    with pytest.raises(WorkflowModelError):
+        run(WorkflowModel(config, client_factory=factory(handler)), on_text=pieces.append)
+    assert len(calls) == 1 and "".join(pieces) == "已展示的正文"
+
+
+@pytest.mark.parametrize("response", [httpx.Response(400), httpx.Response(401), httpx.Response(403), httpx.Response(200, text="bad-json")])
+def test_permanent_http_or_format_error_is_not_retried(config, response):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response
+
+    with pytest.raises(WorkflowModelError):
+        run(WorkflowModel(config, client_factory=factory(handler)))
+    assert len(calls) == 1

@@ -7,7 +7,9 @@ bodies or request headers. Tests can supply an HTTPX client factory.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import ipaddress
 import json
 import math
@@ -28,6 +30,37 @@ class WorkflowModelError(RuntimeError):
 
 class WorkflowModelConfigError(ValueError):
     """Local model settings or environment credentials are not usable."""
+
+
+class _RetryableHTTP(WorkflowModelError):
+    """Only safe status metadata survives beyond the HTTP response scope."""
+
+    def __init__(self, status: int, retry_after: float | None):
+        super().__init__(f"模型服务暂时繁忙（HTTP {status}）。")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _raise_http_error(response: httpx.Response) -> None:
+    status = response.status_code
+    if status in {429, 529, 502, 503, 504}:
+        delay = None
+        value = response.headers.get("retry-after", "").strip()
+        if value:
+            try:
+                delay = float(value)
+                if not math.isfinite(delay) or delay < 0:
+                    delay = None
+            except ValueError:
+                try:
+                    target = parsedate_to_datetime(value)
+                    if target.tzinfo is None:
+                        target = target.replace(tzinfo=timezone.utc)
+                    delay = max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        raise _RetryableHTTP(status, delay)
+    raise WorkflowModelError(f"模型接口 HTTP {status}，请检查连接、额度和权限。")
 
 
 @dataclass(frozen=True)
@@ -495,11 +528,11 @@ class WorkflowModel:
                 if on_text is not None:
                     async with client.stream("POST", _endpoint(settings), headers=headers, json=payload) as response:
                         if not response.is_success:
-                            raise WorkflowModelError(f"模型接口 HTTP {response.status_code}，请检查连接、额度和权限。")
+                            _raise_http_error(response)
                         return await self._stream(response, settings, on_text)
                 response = await client.post(_endpoint(settings), headers=headers, json=payload)
                 if response.status_code < 200 or response.status_code >= 300:
-                    raise WorkflowModelError(f"模型接口 HTTP {response.status_code}，请检查连接、额度和权限。")
+                    _raise_http_error(response)
                 try:
                     result = response.json()
                 except ValueError:
@@ -510,18 +543,60 @@ class WorkflowModel:
             raise WorkflowModelError("模型连接失败，请检查本机网络和代理设置。") from None
         return self._extract(result, settings)
 
+    async def _retry_pause(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+
+    async def _request_with_retries(self, prompt: str, system: str, settings: _Settings,
+                                    budget: _RequestBudget, on_text: Callable[[str], None] | None,
+                                    on_status: Callable[[str], None] | None) -> str:
+        deadline = asyncio.get_running_loop().time() + budget.timeout
+        emitted = False
+
+        def forward(text: str):
+            nonlocal emitted
+            emitted = True
+            if on_text is not None:
+                on_text(text)
+
+        for attempt in range(3):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise WorkflowModelError("模型生成超时；自动重试未增加本次时间预算。")
+            current = budget if attempt == 0 else replace(budget, timeout=remaining)
+            try:
+                return await self._request(prompt, system, settings, current, forward if on_text is not None else None)
+            except _RetryableHTTP as exc:
+                # Only pre-generation HTTP rejections are retryable. Never replay
+                # a partial public answer, a malformed response, or tool output.
+                if emitted or attempt == 2:
+                    raise WorkflowModelError(f"模型服务持续繁忙（HTTP {exc.status}），已停止自动重试；请稍后重试。") from None
+                delay = exc.retry_after if exc.retry_after is not None else float(2 ** (attempt + 1))
+                remaining = deadline - asyncio.get_running_loop().time()
+                if delay > 60 or delay >= remaining:
+                    raise WorkflowModelError(f"模型服务暂时繁忙（HTTP {exc.status}），要求的等待超过本次重试窗口或剩余时间；请稍后重试。") from None
+                if on_status is not None:
+                    try:
+                        on_status(f"模型服务暂时繁忙（HTTP {exc.status}），{delay:g} 秒后进行第 {attempt + 1}/2 次自动重试；可随时停止。")
+                    except Exception:
+                        raise WorkflowModelError("模型重试状态接收失败。") from None
+                await self._retry_pause(delay)
+        raise WorkflowModelError("模型生成未完成。")
+
     async def generate(self, prompt: str, system: str = "", cancel: asyncio.Event | None = None,
                        *, task: str = "default", max_tokens: int | None = None,
                        effort: str | None = None, on_text: Callable[[str], None] | None = None,
-                       generation_budget: str | None = None) -> str:
-        """Generate once; short_json bounds parameter extraction, not long scripts.
+                       generation_budget: str | None = None,
+                       on_status: Callable[[str], None] | None = None) -> str:
+        """Generate with bounded retries for pre-generation transient HTTP errors.
 
         default/script use the large profile (M3: 131072 tokens / 900 seconds).
         short_json without an explicit budget uses 2048 tokens / 60 seconds.
         Explicit generation_budget or max_tokens overrides that small profile.
         on_text receives safe incremental text, never reasoning or tool events;
         emitted text remains provisional until this method returns successfully.
-        The caller still validates JSON. No automatic retry or model fallback.
+        on_status receives public retry notices, separately from answer text.
+        At most two retries share the original deadline; no model fallback.
+        The caller still validates JSON and treats partial text as incomplete.
         """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("模型输入不能为空。")
@@ -529,11 +604,13 @@ class WorkflowModel:
             raise ValueError("模型系统提示词必须是文本。")
         if on_text is not None and not callable(on_text):
             raise ValueError("on_text 必须是文本回调。")
+        if on_status is not None and not callable(on_status):
+            raise ValueError("on_status 必须是状态回调。")
         if cancel is not None and cancel.is_set():
             raise asyncio.CancelledError
         settings = self._settings()
         budget = self._budget(settings, task, max_tokens, effort, generation_budget)
-        request = asyncio.create_task(self._request(prompt, system, settings, budget, on_text))
+        request = asyncio.create_task(self._request_with_retries(prompt, system, settings, budget, on_text, on_status))
         stop = asyncio.create_task(cancel.wait()) if cancel is not None else None
         tasks = {request, stop} if stop is not None else {request}
         try:
@@ -553,6 +630,7 @@ class WorkflowModel:
 async def generate(prompt: str, system: str = "", cancel: asyncio.Event | None = None,
                    *, task: str = "default", max_tokens: int | None = None,
                    effort: str | None = None, on_text: Callable[[str], None] | None = None,
-                   generation_budget: str | None = None) -> str:
+                   generation_budget: str | None = None,
+                   on_status: Callable[[str], None] | None = None) -> str:
     return await WorkflowModel().generate(prompt, system, cancel, task=task, max_tokens=max_tokens, effort=effort,
-                                          on_text=on_text, generation_budget=generation_budget)
+                                          on_text=on_text, generation_budget=generation_budget, on_status=on_status)
