@@ -103,6 +103,14 @@ def router(service: ContentWorkflowService) -> APIRouter:
         except (ValueError, OSError) as exc:
             fail(exc)
 
+    @api.post("/{project_id}/nodes/{node}/chat")
+    async def chat(project_id: str, node: str, request: Request, body: dict = Body(...)):
+        mutation(request)
+        try:
+            return project_view(await service.chat(project_id, node, body))
+        except (ValueError, OSError) as exc:
+            fail(exc)
+
     @api.post("/{project_id}/nodes/{node}/stop")
     async def stop(project_id: str, node: str, request: Request):
         mutation(request)

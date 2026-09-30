@@ -104,11 +104,130 @@ def _endpoint(settings: _Settings) -> str:
     return base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
 
 
+class _VisibleText:
+    """Incrementally hide reasoning tags and credentials, including split tokens."""
+
+    def __init__(self, key: str, callback: Callable[[str], None] | None = None):
+        self.callback = callback
+        self.secrets = {key} | {value for name, value in os.environ.items()
+                               if len(value) >= 8 and any(part in name.upper() for part in ("KEY", "TOKEN", "SECRET", "PASSWORD"))}
+        self.prefixes = {value[:size] for value in self.secrets for size in range(1, len(value))}
+        self.credential_markers = {"sk-": "[redacted]", "ghp_": "[redacted]", "gho_": "[redacted]",
+                                   "ghu_": "[redacted]", "ghs_": "[redacted]", "ghr_": "[redacted]",
+                                   "bearer ": "Bearer [redacted]"}
+        self.marker_prefixes = {value[:size] for value in self.credential_markers for size in range(1, len(value))}
+        self.credential_tail = False
+        self.pending = ""
+        self.tag = ""
+        self.depth = 0
+        self.parts: list[str] = []
+
+    def _release(self, value: str):
+        if not value:
+            return
+        self.parts.append(value)
+        if self.callback:
+            try:
+                self.callback(value)
+            except Exception:
+                raise WorkflowModelError("模型文本流接收失败。") from None
+
+    def _public(self, text: str):
+        ready = ""
+        for char in text:
+            if self.credential_tail:
+                if char.isalnum() or char in "._~+/-=":
+                    continue
+                self.credential_tail = False
+            self.pending += char
+            while self.pending:
+                if self.pending in self.secrets:
+                    ready += "[redacted]"
+                    self.pending = ""
+                elif self.pending.lower() in self.credential_markers:
+                    ready += self.credential_markers[self.pending.lower()]
+                    self.pending = ""
+                    self.credential_tail = True
+                elif self.pending in self.prefixes or self.pending.lower() in self.marker_prefixes:
+                    break
+                else:
+                    ready += self.pending[0]
+                    self.pending = self.pending[1:]
+        self._release(ready)
+
+    def feed(self, text: str):
+        public = ""
+        for char in text:
+            if self.tag:
+                self.tag += char
+                if char == ">":
+                    match = re.fullmatch(r"<\s*(/?)\s*(think|thinking|reasoning)(?:\s[^>]*)?\s*>", self.tag, re.I)
+                    if match:
+                        self.depth = max(0, self.depth - 1) if match[1] else self.depth + 1
+                    elif not self.depth:
+                        public += self.tag
+                    self.tag = ""
+                elif len(self.tag) > 1024:
+                    raise WorkflowModelError("模型返回了未完成的文本标记。")
+                else:
+                    fragment = re.sub(r"^<\s*/?\s*", "", self.tag).lower()
+                    if not any(name.startswith(fragment) or fragment.startswith(name)
+                               for name in ("think", "thinking", "reasoning")):
+                        if not self.depth:
+                            public += self.tag
+                        self.tag = ""
+            elif char == "<":
+                self.tag = char
+            elif not self.depth:
+                public += char
+        self._public(public)
+
+    def finish(self) -> str:
+        if self.depth or self.tag:
+            raise WorkflowModelError("模型返回未完成的思考或文本标记，内容不可视为完成。")
+        self._release("[redacted]" if len(self.pending) >= 4 else self.pending)
+        self.pending = ""
+        text = "".join(self.parts).strip()
+        if not text:
+            raise WorkflowModelError("模型未返回可用的公开文本。")
+        return text
+
+
+async def _sse_events(response: httpx.Response):
+    """Parse SSE frames; never include server data in parse errors."""
+    lines, event_name = [], ""
+    async for line in response.aiter_lines():
+        if line.startswith("data:"):
+            lines.append(line[5:].lstrip(" "))
+            if sum(map(len, lines)) > 1_000_000:
+                raise WorkflowModelError("模型流事件过大。")
+        elif line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif not line and lines:
+            value = "\n".join(lines)
+            lines = []
+            if value == "[DONE]":
+                yield {"type": "sse_done"}
+            else:
+                try:
+                    event = json.loads(value)
+                except ValueError:
+                    raise WorkflowModelError("模型文本流包含无效 JSON。") from None
+                if not isinstance(event, dict):
+                    raise WorkflowModelError("模型文本流格式无效。")
+                if event_name and "type" not in event:
+                    event["type"] = event_name
+                yield event
+            event_name = ""
+    if lines:
+        raise WorkflowModelError("模型文本流意外中断，最后事件不完整。")
+
+
 class WorkflowModel:
-    def __init__(self, config_file: Path | None = None, *, timeout: float = 240,
+    def __init__(self, config_file: Path | None = None, *, timeout: float = 1200,
                  client_factory: Callable[..., httpx.AsyncClient] | None = None):
-        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 300:
-            raise ValueError("模型超时必须在 0 到 300 秒之间。")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 1200:
+            raise ValueError("模型超时必须在 0 到 1200 秒之间。")
         self.config_file = Path(config_file) if config_file is not None else None
         self.timeout = float(timeout)
         self.client_factory = client_factory
@@ -192,13 +311,29 @@ class WorkflowModel:
                 "base_url": settings.base_url, "api": settings.api}
 
     def _budget(self, settings: _Settings, task: str, max_tokens: int | None,
-                effort: str | None) -> _RequestBudget:
+                effort: str | None, generation_budget: str | None = None) -> _RequestBudget:
         if task not in {"default", "script", "short_json"}:
             raise ValueError("未知模型任务预算；可选 default、script 或 short_json。")
+        if generation_budget not in {None, "standard", "large", "maximum"}:
+            raise ValueError("生成预算仅接受 standard、large 或 maximum。")
+        # Official limits, checked 2026-09-30:
+        # https://platform.minimax.cn/docs/api-reference/text-chat-anthropic
+        m3 = settings.model in {"MiniMax-M3.1-Flash-Preview", "MiniMax-M3"}
+        m2 = settings.model in {"MiniMax-M2", "MiniMax-M2.1", "MiniMax-M2.1-highspeed",
+                               "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"}
+        limit = 524288 if m3 else 204800 if m2 else 65536
+        sizes = (65536, 131072, 524288) if m3 else (32768, 65536, 204800) if m2 else (8192, 32768, 65536)
+        profile = generation_budget or "large"
+        profile_index = ("standard", "large", "maximum").index(profile)
+        timeout = (600, 900, 1200)[profile_index]
         if max_tokens is None:
-            max_tokens = 2048 if task == "short_json" else 8192
-        if type(max_tokens) is not int or not 256 <= max_tokens <= 32768:
-            raise ValueError("本工作流生成预算须为 256 到 32768 之间的整数。")
+            max_tokens = 2048 if task == "short_json" and generation_budget is None else sizes[profile_index]
+        if type(max_tokens) is not int or not 256 <= max_tokens <= limit:
+            raise ValueError(f"此模型的工作流生成预算须为 256 到 {limit} 之间的整数。")
+        if task == "short_json" and generation_budget is None and max_tokens <= 2048:
+            timeout = 60
+        elif max_tokens > 131072:
+            timeout = 1200
         if effort is not None and effort not in {"low", "medium", "high", "xhigh", "max"}:
             raise ValueError("思考档位仅接受 low、medium、high、xhigh 或 max；不支持 none。")
         # MiniMax's official contract, checked 2026-09-29:
@@ -214,7 +349,7 @@ class WorkflowModel:
             effort = "low"
         return _RequestBudget(
             max_tokens=max_tokens,
-            timeout=min(self.timeout, 60) if task == "short_json" else self.timeout,
+            timeout=min(self.timeout, timeout),
             effort=effort,
             disable_thinking=task == "short_json" and settings.model == "MiniMax-M3",
         )
@@ -232,7 +367,7 @@ class WorkflowModel:
             blocks = payload.get("content", [])
             if not isinstance(blocks, list):
                 raise WorkflowModelError("模型返回的文本结构无效。")
-            if payload.get("stop_reason") == "tool_use" or any(isinstance(block, dict) and block.get("type") == "tool_use" for block in blocks):
+            if payload.get("stop_reason") == "tool_use" or any(isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"} for block in blocks):
                 raise WorkflowModelError("模型请求了工具调用；此节点只接受文本产出。")
             text = "\n".join(block["text"] for block in blocks
                              if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str))
@@ -254,16 +389,83 @@ class WorkflowModel:
                                  if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str))
         if not isinstance(text, str):
             raise WorkflowModelError("模型未返回有效文本结果。")
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-        if not text or "<think>" in text:
-            raise WorkflowModelError("模型只返回空内容或未完成的思考，未生成可用产物。")
-        # A provider may echo the credential in a malformed answer. Never pass it
-        # to persisted node results, even though it was not part of the prompt.
-        return text.replace(settings.key, "[redacted]")
+        visible = _VisibleText(settings.key)
+        visible.feed(text)
+        return visible.finish()
 
-    async def _request(self, prompt: str, system: str, settings: _Settings, budget: _RequestBudget) -> str:
+    async def _stream(self, response: httpx.Response, settings: _Settings,
+                      on_text: Callable[[str], None]) -> str:
+        visible = _VisibleText(settings.key, on_text)
+        blocks: dict[int, str] = {}
+        finished = False
+        async for event in _sse_events(response):
+            if event.get("type") == "error" or event.get("error"):
+                raise WorkflowModelError("模型文本流返回错误，生成未完成。")
+            base = event.get("base_resp")
+            if isinstance(base, dict) and base.get("status_code", 0) != 0:
+                raise WorkflowModelError("模型服务拒绝了流式生成。")
+            if settings.api == "anthropic-messages":
+                kind = event.get("type")
+                if kind == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if not isinstance(block, dict) or type(event.get("index")) is not int:
+                        raise WorkflowModelError("模型文本流的内容块格式无效。")
+                    block_type = block.get("type")
+                    blocks[event.get("index")] = block_type
+                    if block_type in {"tool_use", "server_tool_use"}:
+                        raise WorkflowModelError("模型请求工具调用；此节点只接受文本。")
+                    if block_type == "text" and isinstance(block.get("text"), str):
+                        visible.feed(block["text"])
+                elif kind == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        raise WorkflowModelError("模型文本流的内容块格式无效。")
+                    if delta.get("type") == "input_json_delta":
+                        raise WorkflowModelError("模型请求工具调用；此节点只接受文本。")
+                    if delta.get("type") == "text_delta":
+                        if blocks.get(event.get("index")) != "text" or not isinstance(delta.get("text"), str):
+                            raise WorkflowModelError("模型文本流的内容块顺序无效。")
+                        visible.feed(delta["text"])
+                elif kind == "message_delta":
+                    reason = (event.get("delta") or {}).get("stop_reason")
+                    if reason is not None:
+                        if reason not in {"end_turn", "stop_sequence"}:
+                            raise WorkflowModelError("模型流式输出被截断或请求了非文本操作，生成未完成。")
+                        finished = True
+                elif kind == "message_stop":
+                    if finished:
+                        return visible.finish()
+                    break
+            else:
+                if event.get("type") == "sse_done":
+                    if finished:
+                        return visible.finish()
+                    break
+                choices = event.get("choices", [])
+                if not isinstance(choices, list):
+                    raise WorkflowModelError("模型文本流格式无效。")
+                for choice in choices:
+                    if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                        continue
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict) or delta.get("tool_calls") or delta.get("function_call"):
+                        raise WorkflowModelError("模型请求工具调用或返回无效文本流。")
+                    reason = choice.get("finish_reason")
+                    if reason is not None:
+                        if reason != "stop":
+                            raise WorkflowModelError("模型流式输出被截断或请求了非文本操作，生成未完成。")
+                        finished = True
+                    text = delta.get("content")
+                    if isinstance(text, str):
+                        visible.feed(text)
+                    elif text is not None:
+                        raise WorkflowModelError("模型文本流内容不是文本。")
+        raise WorkflowModelError("模型文本流意外中断，未收到完整结束标记。")
+
+    async def _request(self, prompt: str, system: str, settings: _Settings, budget: _RequestBudget,
+                       on_text: Callable[[str], None] | None = None) -> str:
         headers = {"Content-Type": "application/json"}
-        payload: dict[str, Any] = {"model": settings.model, "max_tokens": budget.max_tokens, "stream": False}
+        payload: dict[str, Any] = {"model": settings.model, "max_tokens": budget.max_tokens, "stream": on_text is not None}
         if budget.disable_thinking:
             payload["thinking"] = {"type": "disabled"}
         if settings.api == "anthropic-messages":
@@ -290,6 +492,11 @@ class WorkflowModel:
         factory = self.client_factory or httpx.AsyncClient
         try:
             async with factory(**options) as client:
+                if on_text is not None:
+                    async with client.stream("POST", _endpoint(settings), headers=headers, json=payload) as response:
+                        if not response.is_success:
+                            raise WorkflowModelError(f"模型接口 HTTP {response.status_code}，请检查连接、额度和权限。")
+                        return await self._stream(response, settings, on_text)
                 response = await client.post(_endpoint(settings), headers=headers, json=payload)
                 if response.status_code < 200 or response.status_code >= 300:
                     raise WorkflowModelError(f"模型接口 HTTP {response.status_code}，请检查连接、额度和权限。")
@@ -305,23 +512,28 @@ class WorkflowModel:
 
     async def generate(self, prompt: str, system: str = "", cancel: asyncio.Event | None = None,
                        *, task: str = "default", max_tokens: int | None = None,
-                       effort: str | None = None) -> str:
+                       effort: str | None = None, on_text: Callable[[str], None] | None = None,
+                       generation_budget: str | None = None) -> str:
         """Generate once; short_json bounds parameter extraction, not long scripts.
 
-        default/script keep the existing 8192-token, provider-default reasoning
-        behavior. short_json uses 2048 tokens and at most 60 seconds; for known
-        MiniMax models it uses the officially supported low-latency controls.
+        default/script use the large profile (M3: 131072 tokens / 900 seconds).
+        short_json without an explicit budget uses 2048 tokens / 60 seconds.
+        Explicit generation_budget or max_tokens overrides that small profile.
+        on_text receives safe incremental text, never reasoning or tool events;
+        emitted text remains provisional until this method returns successfully.
         The caller still validates JSON. No automatic retry or model fallback.
         """
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("模型输入不能为空。")
         if not isinstance(system, str):
             raise ValueError("模型系统提示词必须是文本。")
+        if on_text is not None and not callable(on_text):
+            raise ValueError("on_text 必须是文本回调。")
         if cancel is not None and cancel.is_set():
             raise asyncio.CancelledError
         settings = self._settings()
-        budget = self._budget(settings, task, max_tokens, effort)
-        request = asyncio.create_task(self._request(prompt, system, settings, budget))
+        budget = self._budget(settings, task, max_tokens, effort, generation_budget)
+        request = asyncio.create_task(self._request(prompt, system, settings, budget, on_text))
         stop = asyncio.create_task(cancel.wait()) if cancel is not None else None
         tasks = {request, stop} if stop is not None else {request}
         try:
@@ -340,5 +552,7 @@ class WorkflowModel:
 
 async def generate(prompt: str, system: str = "", cancel: asyncio.Event | None = None,
                    *, task: str = "default", max_tokens: int | None = None,
-                   effort: str | None = None) -> str:
-    return await WorkflowModel().generate(prompt, system, cancel, task=task, max_tokens=max_tokens, effort=effort)
+                   effort: str | None = None, on_text: Callable[[str], None] | None = None,
+                   generation_budget: str | None = None) -> str:
+    return await WorkflowModel().generate(prompt, system, cancel, task=task, max_tokens=max_tokens, effort=effort,
+                                          on_text=on_text, generation_budget=generation_budget)

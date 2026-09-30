@@ -62,7 +62,11 @@ Easel 左侧的“内容工作流”把一个视频或一篇文章保存为一�
 
 `content_workflow.py` 负责状态与版本，`content_workflow_api.py` 提供本机 API，`workflow_runner.py` 调用受约束的工具。`workflow_archive.py` 和 `workflow_skills.py` 分别负责归档和技能版本。
 
-创意节点通过 `workflow_model.py` 直接请求已配置模型的文本接口，不执行自由 Agent 工具循环。返回内容必须符合节点所需格式。确定性的媒体检查、SDK 调用、模板构建、渲染和发布由固定程序执行。
+创意节点通过 `workflow_model.py` 直接请求已配置模型的文本接口。`workflow_chat.py` 提供各节点助手：读取本节点标准、表单、多份稿件和对话历史，按需只读检索 Obsidian，再提出有类型约束的填写、新稿或执行动作。宿主校验字段范围、版本和上游确认后执行，不运行任意模型命令。
+
+每个节点都保留对话，手动填写与聊天填写可以交替使用。新口播稿保存为新版本并选为主稿；未完成或已停止的回答保留在对话中，不写入稿件。公开发布、归档落盘、Skill 修改仍使用原有明确确认入口。
+
+模型正文通过真实 SSE 文本增量展示；工具开始、完成、取消、失败进入执行动态。显示的是生成内容和可观察的执行状态，不是模型内部推理。刷新或切换页面不会停止后台任务；停止按钮会阻止迟到结果覆盖内容。文档、主稿、标准和归档正文在页内阅读器排版展示，Markdown HTML 经消毒且不自动加载外部图片。
 
 默认读取本机 OpenClaw 的 MiniMax 模型配置，凭证仅取环境变量。可用 `EASEL_WORKFLOW_MODEL`、`EASEL_WORKFLOW_BASE_URL`、`EASEL_WORKFLOW_API` 和 `EASEL_WORKFLOW_KEY` 配置独立模型；跨服务改地址需要显式提供对应 Key。Windows 使用既有受保护服务启动器，使密钥只进入进程环境。
 
@@ -72,14 +76,17 @@ Easel 左侧的“内容工作流”把一个视频或一篇文章保存为一�
 
 截至 2026-09-29，MiniMax 官方文档说明 `MiniMax-M3.1-Flash-Preview` 默认思考档位为 `max`，而且不能关闭思考：传 `thinking.type=disabled` 或 `effort=none` 会报错。思考也计入 `max_tokens`，因此很短的预期 JSON 仍可能耗尽生成额度。此前适配器省略了 effort，实际使用最高档位；现在短参数请求显式选择 `low`，不使用未经该模型文档确认的 `budget_tokens`。[Anthropic 兼容接口说明](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)
 
-`workflow_model.generate()` 的预算按单次请求选择，不改变其他节点：
+节点助手旁可选择生成预算，保存在当前项目设置中，只影响后续运行，切换预算不会让既有产物失效。当前 MiniMax M3/M3.1 Flash 的配置如下，额度包含思考消耗，是上限而非每次固定消费：
 
-| `task` | 默认生成上限 | 总超时上限 | 推理设置 |
-|---|---:|---:|---|
-| `default` / `script` | 8192 tokens | 240 秒 | 保留供应商默认行为；长稿不采用短 JSON 预算 |
-| `short_json` | 2048 tokens | 60 秒 | M3.1 Flash 使用 `low`；M3 使用官方支持的关闭思考；M2 和未知模型不猜测控制字段 |
+| 页面选项 | 生成上限 | 总超时上限 |
+|---|---:|---:|
+| 标准 | 65,536 tokens | 600 秒 |
+| 高额度（默认） | 131,072 tokens | 900 秒 |
+| 最大额度 | 524,288 tokens | 1,200 秒 |
 
-构造模型实例时若指定更短超时，仍以较短值为准。调用方可用 `max_tokens` 明确覆盖本次额度（工作流接受 256–32768），以及为已验证的 M3.1 Flash 指定 `effort`（`low`、`medium`、`high`、`xhigh`、`max`）。Anthropic 格式映射为 `output_config.effort`，MiniMax OpenAI 兼容格式映射为 `reasoning_effort`。[OpenAI 兼容接口说明](https://platform.minimax.cn/docs/api-reference/text-openai-api)
+M3/M3.1 Flash 的上限来自 [MiniMax Messages API](https://platform.minimax.cn/docs/api-reference/text-chat-anthropic)。M2 系列采用 32,768 / 65,536 / 204,800；其他模型采用 8,192 / 32,768 / 65,536，仍受具体供应商接口限制。调用方可传 `generation_budget` 或合法范围内的 `max_tokens`；构造实例时指定更短超时仍以较短值为准。
+
+底层 `short_json` 调用在没有显式档位时保留 2,048 tokens / 60 秒；工作流画面节点会透传页面档位。M3.1 Flash 的短参数请求使用 `low`，长稿和节点对话保留供应商默认推理配置。默认或明确视觉参数仍可完全跳过模型请求。
 
 额度耗尽、超时或输出格式错误都会明确失败，不以不完整内容冒充成功，也不会自动重试或切换模型。低思考档位减少不必要的推理，但不保证所有复杂偏好都能在短预算内完成；模板不支持的要求仍须明确列出。
 

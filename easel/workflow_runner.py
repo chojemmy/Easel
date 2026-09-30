@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -151,9 +152,16 @@ def display_captions(captions: list[dict]) -> tuple[list[dict], list[int]]:
     return rendered, long_indices
 
 
-async def generate(prompt: str, *, system: str, task: str | None = None):
+async def generate(prompt: str, *, system: str, task: str | None = None,
+                   on_text: Callable[[str], None] | None = None,
+                   generation_budget: str | None = None):
     from .workflow_model import generate as model_generate
-    result = await model_generate(prompt, system=system, **({"task": task} if task else {}))
+    options = {"task": task} if task else {}
+    if on_text is not None:
+        options["on_text"] = on_text
+    if generation_budget is not None:
+        options["generation_budget"] = generation_budget
+    result = await model_generate(prompt, system=system, **options)
     return result
 
 
@@ -164,7 +172,7 @@ class WorkflowRunner:
         self.deps = self.sdk / "deps/remotion"
 
     async def execute(self, project: dict, node: dict | str, options: dict, skill: dict,
-                      directory: Path, progress: Callable[[str], None]) -> dict:
+                      directory: Path, progress: Callable[[str | dict], None]) -> dict:
         run = _Run(self, project, node, options, skill, directory, progress)
         return await run.execute()
 
@@ -189,9 +197,15 @@ class _Run:
         self.sdk_run = self.directory / "sdk"
         self.python = str(self.root / ".venv/Scripts/python.exe") if (self.root / ".venv/Scripts/python.exe").is_file() else sys.executable
 
-    def notify(self, text):
+    def notify(self, text: str | dict):
         if self.progress:
-            self.progress(clean_log(text))
+            if isinstance(text, dict):
+                kind = text.get("kind", "status")
+                if kind not in {"status", "generation", "tool", "result"}:
+                    raise ValueError("未知进度事件类型")
+                self.progress({"kind": kind, "text": clean_log(str(text.get("text", "")))})
+            else:
+                self.progress(clean_log(text))
 
     def log(self, text):
         with self.log_path.open("a", encoding="utf-8") as handle:
@@ -219,11 +233,15 @@ class _Run:
 
     async def command(self, args, *, cwd=None, timeout=900, env=None, label="工具执行", check=True):
         args = [str(arg) for arg in args]
-        self.notify(label)
+        self.notify({"kind": "tool", "text": f"开始：{label}"})
         process_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "NO_COLOR": "1", **(env or {})}
         kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-        process = await asyncio.create_subprocess_exec(*args, cwd=str(cwd or self.root), env=process_env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, **kwargs)
+        try:
+            process = await asyncio.create_subprocess_exec(*args, cwd=str(cwd or self.root), env=process_env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, **kwargs)
+        except OSError:
+            self.notify({"kind": "result", "text": f"{label}未能启动，请查看运行日志。"})
+            raise
 
         async def collect():
             chunks = bytearray()
@@ -240,12 +258,13 @@ class _Run:
         async def heartbeat():
             while True:
                 await asyncio.sleep(10)
-                self.notify(f"{label}仍在运行…")
+                if process.returncode is None:
+                    self.notify({"kind": "status", "text": f"{label}仍在运行…"})
 
         beat = asyncio.create_task(heartbeat())
         try:
             output = await asyncio.wait_for(collect(), timeout=timeout)
-        except BaseException:
+        except BaseException as exc:
             if process.returncode is None:
                 if os.name == "nt":
                     killer = await asyncio.create_subprocess_exec("taskkill", "/PID", str(process.pid), "/T", "/F", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
@@ -257,12 +276,15 @@ class _Run:
                         pass
                 await asyncio.shield(process.wait())
             self.log(f"{label}已取消或超时；仅停止本次子进程树。")
+            reason = "已取消" if isinstance(exc, asyncio.CancelledError) else "已超时" if isinstance(exc, TimeoutError) else "异常中断"
+            self.notify({"kind": "result", "text": f"{label}{reason}；本次工具进程已停止。"})
             raise
         finally:
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
         output = clean_log(output)
         self.log(f"[{label}] exit={process.returncode}\n{output}")
+        self.notify({"kind": "result", "text": f"{label}执行结束（退出码 {process.returncode}）。"})
         if check and process.returncode:
             raise RunnerBlocked(f"{label}失败（exit={process.returncode}）。详情见运行日志：{output[-600:]}")
         return process.returncode, output
@@ -293,6 +315,7 @@ class _Run:
             result = {"status": "blocked", "message": clean_log(str(exc)), "artifacts": []}
         except asyncio.CancelledError:
             self.log("用户取消本节点。")
+            self.notify({"kind": "result", "text": "本节点已取消，已生成的内容保留供查看。"})
             raise
         except Exception as exc:
             self.log(f"{type(exc).__name__}: {exc}")
@@ -305,6 +328,7 @@ class _Run:
         result.setdefault("status", "awaiting_review")
         result.setdefault("artifacts", [])
         self.log(f"节点状态：{result['status']}")
+        self.notify({"kind": "result", "text": result.get("message") or f"节点状态：{result['status']}"})
         result["artifacts"] += [self.artifact(skill_path, "本次执行 Skill"), self.artifact(self.log_path, "运行日志", "log")]
         return result
 
@@ -324,7 +348,52 @@ class _Run:
         if feedback and str(feedback) not in prompt:
             prompt += f"\n本次修改意见（仅在本节点支持范围内执行）：{feedback}"
         system = "你是文本/JSON编写器，没有工具，不能读取文件或运行命令。Skill中的执行性条款由宿主程序处理；本请求只输出用户prompt指定的文本或JSON产物，不讨论或模拟执行过程。下面保留全部Skill，供内容与偏好遵循：\n\n" + str(self.skill.get("content") or "按输入要求输出，不执行外部动作。")
-        return await generate(prompt, system=system, **({"task":"short_json"} if self.node == "build" else {}))
+        # on_text receives final-answer deltas only. The provider adapter owns
+        # reasoning/thinking filtering; the runner never receives those fields.
+        accumulated = ""
+        last_emitted = ""
+        last_sent_at = -math.inf
+        pending_flush = None
+        loop = asyncio.get_running_loop()
+
+        def flush():
+            nonlocal last_emitted, last_sent_at, pending_flush
+            if pending_flush is not None:
+                pending_flush.cancel()
+                pending_flush = None
+            if accumulated and accumulated != last_emitted:
+                self.notify({"kind": "generation", "text": accumulated})
+                last_emitted = accumulated
+                last_sent_at = loop.time()
+
+        def on_text(delta: str):
+            nonlocal accumulated, pending_flush
+            if not isinstance(delta, str) or not delta:
+                return
+            accumulated += delta
+            # First text is immediate; subsequent disk/UI snapshots are <=4 Hz.
+            elapsed = loop.time() - last_sent_at
+            if elapsed >= .25:
+                flush()
+            elif pending_flush is None:
+                pending_flush = loop.call_later(.25 - elapsed, flush)
+
+        options = {"task": "short_json"} if self.node == "build" else {}
+        # Compatibility for older injected adapters, without retrying (and
+        # therefore possibly duplicating) a generation request after TypeError.
+        parameters = inspect.signature(generate).parameters
+        accepts_options = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        if "on_text" in parameters or accepts_options:
+            options["on_text"] = on_text
+        if "generation_budget" in parameters or accepts_options:
+            options["generation_budget"] = (self.project.get("settings") or {}).get("generation_budget", "large")
+        try:
+            result = await generate(prompt, system=system, **options)
+            if isinstance(result, str):
+                accumulated = result  # Canonical final text, never a fake stream.
+            return result
+        finally:
+            flush()
 
     async def visual_parameters(self, settings: dict, template: str) -> tuple[dict, str]:
         explicit = None

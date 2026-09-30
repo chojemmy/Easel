@@ -138,6 +138,65 @@ def test_model_failure_does_not_create_fake_manuscript(case, monkeypatch):
     assert not list((case[1]/"artifacts").glob("manuscript-*.md"))
 
 
+def test_generation_progress_streams_only_text_as_throttled_snapshots(case,monkeypatch):
+    events=[]
+    parts=["这是", "可查看的正文", "。", " api_key=private-secret-value"]
+    async def model(prompt,*,system,on_text):
+        on_text(parts[0])
+        assert events[-1]=={"kind":"generation","text":"这是"}
+        # An unexpected metadata object is never serialized to a UI snapshot.
+        on_text({"reasoning":"INTERNAL_REASONING_MUST_NOT_APPEAR"})
+        for part in parts[1:]:
+            on_text(part)
+        assert len([e for e in events if isinstance(e,dict) and e['kind']=='generation'])==1
+        return ''.join(parts)
+    monkeypatch.setattr(module,"generate",model)
+    root,directory,project=case
+    runner=module._Run(WorkflowRunner(root),project,"script",{}, {"content":"仅生成正文"},directory,events.append)
+    result=asyncio.run(runner.model("写一段稿件"))
+    snapshots=[event['text'] for event in events if isinstance(event,dict) and event['kind']=='generation']
+    assert len(snapshots)==2
+    assert snapshots[-1]=="这是可查看的正文。 api_key=[REDACTED]"
+    assert "INTERNAL_REASONING" not in json.dumps(events)
+    assert result==''.join(parts)  # Display sanitization never rewrites the artifact.
+
+
+@pytest.mark.parametrize("node,budget,expected",[
+    ("script",None,"large"),("brief","standard","standard"),
+    ("transcript","large","large"),("storyboard","maximum","maximum"),
+    ("build","maximum","maximum"),("build","standard","standard"),
+])
+def test_generation_budget_reaches_adapter_for_every_creative_node(case,monkeypatch,node,budget,expected):
+    from easel import workflow_model
+    calls=[]
+    async def adapter(prompt,*,system,on_text,generation_budget,task=None):
+        calls.append({"budget":generation_budget,"task":task})
+        on_text("真实正文")
+        return "真实正文"
+    monkeypatch.setattr(workflow_model,"generate",adapter)
+    root,directory,project=case
+    if budget is not None:
+        project["settings"]["generation_budget"]=budget
+    events=[]
+    runner=module._Run(WorkflowRunner(root),project,node,{}, {},directory,events.append)
+    assert asyncio.run(runner.model("生成测试产物"))=="真实正文"
+    assert calls==[{"budget":expected,"task":"short_json" if node=="build" else None}]
+    assert {"kind":"generation","text":"真实正文"} in events
+
+
+@pytest.mark.parametrize("exit_code",[0,7])
+def test_tool_progress_reports_actual_exit_without_command_or_stdout(case,exit_code):
+    events=[]
+    root,directory,project=case
+    runner=module._Run(WorkflowRunner(root),project,"brief",{}, {},directory,events.append)
+    args=[module.sys.executable,"-c",f"print('private-tool-output');raise SystemExit({exit_code})"]
+    actual,_=asyncio.run(runner.command(args,label="媒体检查",check=False))
+    assert actual==exit_code
+    assert events==[{"kind":"tool","text":"开始：媒体检查"},{"kind":"result","text":f"媒体检查执行结束（退出码 {exit_code}）。"}]
+    assert "private-tool-output" not in json.dumps(events)
+    assert module.sys.executable not in json.dumps(events)
+
+
 @pytest.mark.parametrize("segments", [[],[{"start":0,"end":11,"text":"越界"}],[{"start":0,"end":2,"text":"第一句"},{"start":1,"end":3,"text":"重叠"}],[{"start":0,"end":1,"text":""}]])
 def test_subtitle_validation_rejects_missing_overlap_and_source_overrun(segments):
     with pytest.raises(RunnerBlocked):

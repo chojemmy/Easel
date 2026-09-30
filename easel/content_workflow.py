@@ -37,7 +37,7 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_error(error: object) -> str:
+def safe_error(error: object, limit: int | None = 1400) -> str:
     message = str(error)
     for name, value in os.environ.items():
         if len(value) >= 8 and any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
@@ -45,7 +45,7 @@ def safe_error(error: object) -> str:
     message = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [已隐藏凭证]", message)
     message = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "[已隐藏凭证]", message)
     message = re.sub(r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)", r"\1[已隐藏凭证]", message)
-    return message[:1400]
+    return message[:limit] if limit is not None else message
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -89,6 +89,12 @@ class ContentWorkflowService:
                     project = json.loads(file.read_text(encoding="utf-8"))
                     changed = False
                     for node in project.get("nodes", []):
+                        if node.get("chat", {}).get("status") == "running":
+                            node["chat"]["status"] = "stopped"
+                            for message in node["chat"].get("messages", []):
+                                if message.get("status") == "streaming":
+                                    message["status"] = "stopped"
+                            changed = True
                         if node["status"] == "running":
                             node.update(status="blocked", message="服务已重启，本次运行中断；检查产物后重试。")
                             if node["id"] == "publish" and node.get("runs") and node["runs"][-1].get("action") in ("draft", "publish"):
@@ -154,7 +160,7 @@ class ContentWorkflowService:
             return self.save(project)
 
     def _idle(self, project: dict) -> None:
-        if any(n["status"] == "running" for n in project["nodes"]):
+        if any(n["status"] == "running" or n.get("chat", {}).get("status") == "running" for n in project["nodes"]):
             raise WorkflowConflict("该工作流有节点正在执行，请先停止或等待完成。")
 
     def invalidate(self, project: dict, first: str, reason: str) -> None:
@@ -222,6 +228,12 @@ class ContentWorkflowService:
                         value.pop(generated, None)
                 if key == "settings":
                     changed = {k for k in value if value[k] != p[key].get(k)}
+                    if "generation_budget" in changed and value["generation_budget"] not in {"standard", "large", "maximum"}:
+                        raise ValueError("请选择标准、高额度或最大生成预算")
+                    if changed <= {"generation_budget"}:
+                        p[key] = value
+                        continue
+                    changed.discard("generation_budget")
                     if changed & {"visual_style", "subtitle_style"} and "visual_parameters" not in changed:
                         # A form sends existing settings back; stale explicit props
                         # must not silently override a newly entered style request.
@@ -258,6 +270,11 @@ class ContentWorkflowService:
             if any(part.startswith(".") or part in ("_Agent", "node_modules", ".trash") for part in rel.parts):
                 continue
             if query in path.stem.lower():
+                resolved = path.resolve()
+                if not resolved.is_relative_to(self.vault) or any(part.startswith(".") or part in ("_Agent", "node_modules") for part in resolved.relative_to(self.vault).parts):
+                    continue
+                if not resolved.is_file() or resolved.stat().st_size > 2_000_000:
+                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")[:600]
                 results.append({"title": path.stem, "path": str(rel).replace("\\", "/"), "excerpt": text})
                 if len(results) >= 30:
@@ -314,12 +331,43 @@ class ContentWorkflowService:
             self.tasks[project_id] = task
             return result
 
-    def progress(self, project_id: str, node: str, run_id: str, message: str) -> None:
+    def activity(self, project: dict, node: str, event: str | dict, run_id: str = "") -> None:
+        item = {"kind": "status", "text": event} if isinstance(event, str) else event
+        kind = item.get("kind", "status")
+        if kind not in {"status", "generation", "tool", "result", "error"}:
+            kind = "status"
+        # Large generated text is a snapshot, not a new entry for every token.
+        raw = str(item.get("text", ""))[:160000 if kind == "generation" else 1400]
+        text = safe_error(raw, None) if kind == "generation" else safe_error(raw)
+        events = node_of(project, node).setdefault("activity", [])
+        if events and events[-1]["kind"] == kind and events[-1].get("run_id") == run_id and (kind == "generation" or events[-1]["text"] == text):
+            events[-1].update(text=text, at=now())
+        else:
+            events.append({"id": uuid.uuid4().hex[:12], "kind": kind, "text": text, "at": now(), "run_id": run_id})
+        del events[:-100]
+
+    async def chat(self, project_id: str, node: str, body: dict) -> dict:
+        from .workflow_chat import start_chat
+        return await start_chat(self, project_id, node, body)
+
+    def progress_chat(self, project_id: str, node: str, turn_id: str, message: str) -> None:
+        with self._lock:
+            p = self.get(project_id)
+            if node_of(p, node).get("chat", {}).get("turn_id") != turn_id:
+                return
+            self.activity(p, node, message, turn_id)
+            self.save(p)
+
+    def progress(self, project_id: str, node: str, run_id: str, message: str | dict) -> None:
         with self._lock:
             p = self.get(project_id)
             n = node_of(p, node)
             if n["status"] == "running" and n["runs"][-1]["id"] == run_id:
-                n["message"] = message
+                self.activity(p, node, message, run_id)
+                if isinstance(message, str):
+                    n["message"] = safe_error(message)
+                elif message.get("kind") != "generation":
+                    n["message"] = safe_error(message.get("text", ""))
                 self.save(p)
 
     async def _execute(self, snapshot: dict, node: str, options: dict, skill: dict, run_id: str):
@@ -346,6 +394,7 @@ class ContentWorkflowService:
                 if result.get("publication_uncertain"):
                     n["publication_uncertain"] = True
                 n["runs"][-1].update(status=n["status"], message=safe_error(n["message"]), finished_at=now())
+                self.activity(p, node, {"kind": "result", "text": n["message"]}, run_id)
                 if n["status"] in ("completed", "awaiting_review"):
                     for feedback in n["feedback"]:
                         if not feedback.get("applied_run_id"):
@@ -371,6 +420,7 @@ class ContentWorkflowService:
                     n["publication_uncertain"] = True
                     n["message"] += " 提交结果需要到平台核实，已阻止自动重发。"
                 n["runs"][-1].update(status=status, message=safe_error(n["message"]), finished_at=now())
+                self.activity(p, node, {"kind": "error", "text": n["message"]}, run_id)
                 self.save(p)
 
     def reconcile_not_submitted(self, project_id: str, note: str) -> dict:
@@ -405,7 +455,10 @@ class ContentWorkflowService:
         p = self.get(project_id)
         n = node_of(p, node)
         task = self.tasks.get(project_id)
-        if task and n["status"] == "running":
+        if task and (n["status"] == "running" or n.get("chat", {}).get("status") == "running"):
+            if n.get("chat", {}).get("status") == "running":
+                from .workflow_chat import finish_chat
+                finish_chat(self, project_id, node, "stopped", "正在停止；未完成的回复不会应用到内容。")
             task.cancel()
             try:
                 await task
@@ -415,6 +468,9 @@ class ContentWorkflowService:
             current = node_of(self.get(project_id), node)
             if current["status"] == "running":
                 self._finish_error(project_id, node, current["runs"][-1]["id"], "blocked", "已停止，尚未开始执行。")
+            if current.get("chat", {}).get("status") == "running":
+                from .workflow_chat import finish_chat
+                finish_chat(self, project_id, node, "stopped", "已停止，尚未完成的回复没有应用到内容。")
             if self.tasks.get(project_id) is task:
                 self.tasks.pop(project_id, None)
         return self.get(project_id)
@@ -422,7 +478,7 @@ class ContentWorkflowService:
     async def shutdown(self):
         for project_id in list(self.tasks):
             p = self.get(project_id)
-            active = next((n for n in p["nodes"] if n["status"] == "running"), None)
+            active = next((n for n in p["nodes"] if n["status"] == "running" or n.get("chat", {}).get("status") == "running"), None)
             if active:
                 await self.stop(project_id, active["id"])
 
