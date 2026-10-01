@@ -287,7 +287,9 @@ export default function ContentWorkflowPage() {
   const attention = orderedNodes.find((item) => ['failed', 'error', 'blocked', 'unknown', 'unverified', 'result_unknown', 'stale', 'invalidated'].includes(item.status)) || orderedNodes.find((item) => running(item)) || orderedNodes.find((item) => !finished(item));
   const settings = draft?.settings || {};
   const archiveResult = project?.archive;
-  const usedSkills = Array.from(new Map([...(skills?.used_skills || []), ...(node?.chat?.messages.flatMap((message) => message.skills_used || []) || [])].map((item) => [`${item.name}:${item.path}`, item])).values());
+  // The endpoint merges current execution receipts with chat history. Keep its
+  // version when an older chat read refers to the same source file.
+  const usedSkills = Array.from(new Map([...(node?.chat?.messages.flatMap((message) => message.skills_used || []) || []), ...(skills?.used_skills || [])].map((item) => [`${item.name}:${item.path}`, item])).values());
   const publishPlatform = asText(settings.publish_platform) || 'weixin-channels';
   const canSavePlatformDraft = project?.kind === 'video' && publishPlatform === 'weixin-channels';
   const canPublishPublicly = project?.kind === 'video' && ['weixin-channels', 'kuaishou'].includes(publishPlatform);
