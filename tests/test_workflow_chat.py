@@ -128,3 +128,46 @@ def test_old_chat_completion_cannot_close_new_turn(service):
     service.save(p)
     chat.finish_chat(service, p["id"], "brief", "completed", turn_id="old")
     assert node_of(service.get(p["id"]), "brief")["chat"]["status"] == "running"
+
+
+@pytest.mark.parametrize("result_status", ["completed", "blocked", "failed"])
+def test_chat_reply_tracks_real_node_execution_and_outcome(service, monkeypatch, result_status):
+    model(monkeypatch, {"reply": "现在执行。", "action": "run"})
+    ready, release = asyncio.Event(), asyncio.Event()
+    class Execute:
+        async def execute(self, project, node, options, skill, directory, progress):
+            progress({"kind": "status", "phase": "transcribing", "text": "正在转录音频"})
+            ready.set()
+            await release.wait()
+            return {"status": result_status, "message": "真实执行结果", "artifacts": []}
+    service.executor = Execute()
+    p = service.create({"title": "执行回传"})
+    async def run():
+        await service.chat(p["id"], "brief", {"message": "执行本节点", "content_version": p["content_version"]})
+        parent = service.tasks[p["id"]]
+        await asyncio.wait_for(ready.wait(), 2)
+        n = node_of(service.get(p["id"]), "brief")
+        execution = n["chat"]["messages"][-1]["execution"]
+        assert execution["status"] == "running" and execution["phase"] == "transcribing"
+        assert execution["message"] == "正在转录音频"
+        assert n["status"] == "running" and n["chat"]["status"] == "idle"
+        release.set()
+        await parent
+        n = node_of(service.get(p["id"]), "brief")
+        execution = n["chat"]["messages"][-1]["execution"]
+        assert execution["status"] == result_status and execution["message"] == "真实执行结果"
+        assert execution["finished_at"]
+        assert n["activity"][-1]["kind"] == ("error" if result_status in {"blocked", "failed"} else "result")
+    asyncio.run(run())
+
+
+def test_run_that_cannot_start_has_a_visible_failure_under_its_reply(service, monkeypatch):
+    model(monkeypatch, {"reply": "现在开始转录。", "action": "run"})
+    p = service.create({"title": "上游未完成"})
+    async def run():
+        _, final = await exchange(service, p["id"], "transcript", "执行")
+        message = node_of(final, "transcript")["chat"]["messages"][-1]
+        assert message["execution"]["status"] == "failed"
+        assert "录制与导入" in message["execution"]["message"]
+        assert not node_of(final, "transcript")["runs"]
+    asyncio.run(run())

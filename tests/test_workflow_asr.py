@@ -88,6 +88,64 @@ def raw_transcript(source):
             "segments": [{"start": 1.2, "end": 3.7, "text": "瑞莫神", "words": [{"word": "瑞莫神", "start": 1.2, "end": 3.7}]}, {"start": 4.1, "end": 9.3, "text": "录音原话"}]}
 
 
+@pytest.mark.parametrize("field", ["transcript_path", "transcript_reference_path"])
+@pytest.mark.parametrize("extension", [".txt", ".md"])
+def test_plain_text_is_a_read_only_reference_and_audio_supplies_timestamps(transcription, field, extension):
+    root, directory, project, _, source = transcription
+    reference = root / ("校对稿" + extension)
+    reference.write_text("Remotion 的校对参考文本", encoding="utf-8-sig")
+    original_bytes = reference.read_bytes()
+    project["media"][field] = str(reference)
+    original = json.loads(json.dumps(project))
+    calls, events = [], []
+    class Agent:
+        async def execute(self, **kwargs):
+            calls.append(kwargs)
+            assert "Remotion 的校对参考文本" in kwargs["context"]["reference_manuscript"]
+            assert "Remotion 是真实术语" in kwargs["context"]["reference_manuscript"]
+            assert kwargs["context"]["command_argv"][kwargs["context"]["command_argv"].index("--src") + 1] == str(source)
+            runner.write_json(kwargs["directory"] / "transcript.json", raw_transcript(source))
+            runner.write_json(kwargs["directory"] / "corrections.json", {"corrections": [{"index": 0, "text": "Remotion"}], "unsupported_requests": []})
+    result = asyncio.run(runner.WorkflowRunner(root, skill_agent=Agent()).execute(project, "transcript", {}, {}, directory, events.append))
+    assert result["status"] == "completed" and len(calls) == 1
+    assert project == original and reference.read_bytes() == original_bytes
+    report = runner.read_json(directory / "artifacts/transcription-report.json")
+    assert report["reference_file"]["path"] == str(reference)
+    assert report["reference_manuscript"]["id"] == "main"
+    final = runner.read_json(directory / "artifacts/transcript.json")
+    assert [(s["start"], s["end"]) for s in final["segments"]] == [(1.2, 3.7), (4.1, 9.3)]
+    assert final["segments"][0]["text"] == "Remotion"
+    assert result["media"]["transcript_reference_path"] == str(reference)
+    if field == "transcript_path":
+        assert result["media"]["transcript_path"] == ""
+    assert any(isinstance(e, dict) and e.get("phase") == "transcribing" for e in events)
+
+
+def test_existing_timestamped_subtitles_keep_their_times_with_reference_file(transcription):
+    root, directory, project, _, source = transcription
+    supplied = runner.write_json(root / "existing.json", raw_transcript(source))
+    reference = root / "reference.txt"
+    reference.write_text("校对参考", encoding="utf-8")
+    project["media"] = {"transcript_path": str(supplied), "transcript_reference_path": str(reference)}
+    class NoAgent:
+        async def execute(self, **kwargs):
+            pytest.fail("Existing timed subtitles must not run ASR again")
+    result = asyncio.run(runner.WorkflowRunner(root, skill_agent=NoAgent()).execute(project, "transcript", {}, {}, directory, None))
+    assert result["status"] == "completed"
+    final = runner.read_json(directory / "artifacts/transcript.json")
+    assert [(s["start"], s["end"]) for s in final["segments"]] == [(1.2, 3.7), (4.1, 9.3)]
+
+
+@pytest.mark.parametrize("content", ["", "\x00binary"])
+def test_unusable_plain_reference_stops_with_a_specific_reason(transcription, content):
+    root, directory, project, _, _ = transcription
+    reference = root / "reference.txt"
+    reference.write_text(content, encoding="utf-8")
+    project["media"]["transcript_path"] = str(reference)
+    result = asyncio.run(runner.WorkflowRunner(root).execute(project, "transcript", {}, {}, directory, None))
+    assert result["status"] == "blocked" and "校对稿" in result["message"]
+
+
 @pytest.mark.parametrize("bad", [None, "timestamp", "missing_file", "wrong_source"])
 def test_original_agent_transcribes_reads_selected_manuscript_and_host_validates(transcription, bad):
     root, directory, project, original, source = transcription

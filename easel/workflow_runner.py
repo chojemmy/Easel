@@ -209,7 +209,10 @@ class _Run:
                 kind = text.get("kind", "status")
                 if kind not in {"status", "generation", "tool", "result"}:
                     raise ValueError("未知进度事件类型")
-                self.progress({"kind": kind, "text": clean_log(str(text.get("text", "")))})
+                event = {"kind": kind, "text": clean_log(str(text.get("text", "")))}
+                if text.get("phase") in {"preparing", "transcribing", "correcting", "validating"}:
+                    event["phase"] = text["phase"]
+                self.progress(event)
             else:
                 self.progress(clean_log(text))
 
@@ -560,7 +563,7 @@ class _Run:
         config = write_json(self.artifacts / "sdk-config.json", {"proxy": False})
         args = ["init", "--source", source, "--out", self.directory / "sdk-output", "--run-dir", self.sdk_run, "--config", config, "--brief", str(self.project.get("title") or "内容制作")]
         transcript = self.file_setting("transcript_path", False)
-        if transcript:
+        if transcript and transcript.suffix.lower() in {".srt", ".vtt", ".json"}:
             args += ["--transcript", transcript]
         await self.sdk_command(*args)
         await self.sdk_command("stage", "ingest", "--run-dir", self.sdk_run)
@@ -582,6 +585,7 @@ class _Run:
             args += ["--reference-file", str(reference_path)]
         correction = None
         if self.runner.skill_agent is None:
+            self.notify({"kind": "status", "phase": "transcribing", "text": "正在运行本地 ASR，根据视频音轨生成真实时间戳…"})
             await self.command(args, timeout=7200, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
                                label=f"本地 ASR：{model['name']}（已缓存、离线）")
         else:
@@ -600,13 +604,27 @@ class _Run:
                 "宿主会验证并应用 corrections，不能直接修改工作流主稿、状态或确认记录。"
             )
             self.notify({"kind": "tool", "text": "转录本步已接入原 Easel Agent，将读取主稿并调用本地 ASR 工具。"})
-            await self.runner.skill_agent.execute(project_id=self.project["id"], node="transcript",
+            self.notify({"kind": "status", "phase": "transcribing", "text": "正在由原 Agent 调用本地 ASR，根据视频音轨生成真实时间戳…"})
+            execution = asyncio.create_task(self.runner.skill_agent.execute(project_id=self.project["id"], node="transcript",
                 skill={"name": "video-production", "layer": "produce", "source_path": str(source)},
                 instruction=task, directory=target_dir,
                 context={"command_argv": args, "reference_path": str(reference_path) if reference_path else "",
                          "reference_manuscript": reference, "feedback": self.options.get("feedback", ""),
                          "duration": metadata["duration"], "asr_model": model, "node_standard": self.skill.get("content", "")},
-                on_event=self.notify, timeout=1200)
+                on_event=self.notify, timeout=1200))
+            started = time.monotonic()
+            try:
+                while not execution.done():
+                    done, _ = await asyncio.wait({execution}, timeout=10)
+                    if not done:
+                        produced = target.is_file()
+                        self.notify({"kind": "status", "phase": "correcting" if produced else "transcribing",
+                            "text": ("ASR 字幕文件已生成，正在校对文字并等待原 Agent 交付结果" if produced else "本地 ASR 任务仍在执行，正在等待带时间戳的字幕文件") + f"（本次已等待 {int(time.monotonic() - started)} 秒）。"})
+                await execution
+            finally:
+                if not execution.done():
+                    execution.cancel()
+                    await asyncio.gather(execution, return_exceptions=True)
             if reference or self.options.get("feedback"):
                 correction_path = target_dir / "corrections.json"
                 if correction_path.is_symlink() or not correction_path.is_file():
@@ -623,18 +641,44 @@ class _Run:
     async def step_transcript(self):
         metadata = read_json(self.artifacts / "source-metadata.json")
         supplied = self.file_setting("transcript_path", False)
+        reference_file = self.file_setting("transcript_reference_path", False)
+        plain_supplied = supplied is not None and supplied.suffix.lower() in {".txt", ".md"}
+        if plain_supplied:
+            reference_file = reference_file or supplied
+            self.notify({"kind": "tool", "phase": "preparing", "text": "提供的是纯文本校对稿，将读取它校正文字；字幕时间戳会从原视频音轨生成。"})
+            supplied = None
         reference = self.primary()
         reference_text = str((reference or {}).get("content") or "").strip()
         reference_path = None
         reference_record = None
+        reference_file_record = None
         if reference_text:
-            reference_path = self.artifacts / "transcript-reference.md"
-            reference_path.write_text(reference_text + "\n", encoding="utf-8")
             reference_record = {"id": reference.get("id"), "title": reference.get("title"),
                                 "sha256": hashlib.sha256(reference_text.encode("utf-8")).hexdigest()}
             self.notify({"kind": "tool", "text": f"已读取当前主稿：{reference.get('title') or '口播稿'}（{len(reference_text)} 字），用于识别上下文和术语校对。"})
-        else:
+        elif not reference_file:
             self.notify("没有已选主稿，将按原录音转录；时间轴仍来自音频。")
+        if reference_file:
+            if reference_file.suffix.lower() not in {".txt", ".md"}:
+                raise RunnerBlocked("校对稿请提供 TXT 或 Markdown；带时间戳的字幕请放到字幕输入。")
+            if reference_file.stat().st_size > 2_000_000:
+                raise RunnerBlocked("校对稿超过 2 MB，请选取本次录音需要的文本。")
+            try:
+                file_text = reference_file.read_text(encoding="utf-8-sig").strip()
+            except UnicodeDecodeError:
+                try:
+                    file_text = reference_file.read_text(encoding="gb18030").strip()
+                except UnicodeDecodeError:
+                    raise RunnerBlocked("校对稿编码无法识别，请保存为 UTF-8 文本。") from None
+            if not file_text or "\x00" in file_text or len(file_text) > 500000:
+                raise RunnerBlocked("校对稿为空、不是纯文本或超过 50 万字，请检查文件。")
+            reference_file_record = {"path": str(reference_file), "title": reference_file.name,
+                "sha256": await asyncio.to_thread(file_sha256, reference_file)}
+            self.notify({"kind": "tool", "phase": "preparing", "text": f"已读取纯文本校对稿：{reference_file.name}（{len(file_text)} 字）；原文件保持不变。"})
+            reference_text = file_text + ("\n\n已选主稿（辅助术语参考）：\n" + reference_text if reference_text and reference_text != file_text else "")
+        if reference_text:
+            reference_path = self.artifacts / "transcript-reference.md"
+            reference_path.write_text(reference_text + "\n", encoding="utf-8")
         model = None
         correction = None
         state_path = self.sdk_run / "run-state.json"
@@ -643,7 +687,7 @@ class _Run:
         state["config"].pop("transcript", None)
         if supplied:
             if supplied.suffix.lower() not in {".srt", ".vtt", ".json"}:
-                raise RunnerBlocked("字幕仅接受有时间戳的 SRT/VTT/JSON。")
+                raise RunnerBlocked("请提供带时间戳的 SRT/VTT/JSON，或 TXT/Markdown 校对稿以从视频生成字幕。")
             if supplied.suffix.lower() == ".json":
                 segments = validate_transcript(read_json(supplied), metadata["duration"])
                 normalized = write_json(self.artifacts / "imported-transcript.json", {"segments": segments, "duration": metadata["duration"]})
@@ -663,12 +707,14 @@ class _Run:
                 state["config"]["transcript"] = str(local_transcript)
             elif not os.environ.get("SILICONFLOW_API_KEY", "").strip():
                 raise RunnerBlocked("已检查本地模型配置、Easel 和 Hugging Face 缓存，未找到完整的 faster-whisper 模型，也没有云端 ASR 凭证。" + ("口播稿已读取，但没有录音时间戳；" if reference_text else "") + "请提供 SRT 或已有模型路径，不会自动下载模型。")
+        self.notify({"kind": "status", "phase": "validating", "text": "正在导入真实字幕并校验原片时间轴…"})
         write_json(state_path, state)
         await self.sdk_command("stage", "transcribe", "--run-dir", self.sdk_run, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         raw_data = read_json(self.sdk_run / "artifacts/transcript.json")
         segments = validate_transcript(raw_data, metadata["duration"])
         raw_path = write_json(self.artifacts / "raw-transcript.json", {**raw_data, "duration": metadata["duration"], "source_sha256": metadata.get("source_sha256")})
         if correction is None and (self.options.get("feedback") or (not supplied and reference_text)):
+            self.notify({"kind": "status", "phase": "correcting", "text": "音频转录已完成，正在结合校对稿与主稿修正错词、专名和标点…"})
             correction = parse_json_reply(await self.model("结合已选主稿和修改意见，仅校正转录错词/专有名词/标点。主稿是参考而非实际说出的文字；不得插入未说出的稿件，不能改时间戳、删句、粗剪、增编台词或改原意。不确定时保留录音原文。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests。参考主稿：" + reference_text + "\n实际转录：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False)))
         if correction is not None:
             if not isinstance(correction,dict) or set(correction) != {"corrections","unsupported_requests"} or not isinstance(correction["corrections"],list) or not isinstance(correction["unsupported_requests"],list):
@@ -683,18 +729,23 @@ class _Run:
                 segments[item["index"]]["text"] = item["text"].strip()
             segments = validate_transcript({"segments":segments},metadata["duration"])
             self.notify({"kind": "result", "text": f"已依据主稿/修改意见校对 {len(correction['corrections'])} 条字幕，保留全部原录音时间戳。"})
+        self.notify({"kind": "status", "phase": "validating", "text": "文字校对已完成，正在校验时间戳并保存字幕与报告…"})
         transcript_path = write_json(self.artifacts / "transcript.json", {"segments": segments, "duration": metadata["duration"], "source_sha256":metadata.get("source_sha256"), "timeline_mode": "original_no_cuts"})
         captions = [{"text": s["text"], "startMs": round(s["start"] * 1000), "endMs": round(s["end"] * 1000), "timestampMs": None, "confidence": None} for s in segments]
         caption_path = write_json(self.artifacts / "captions.json", captions)
         report = write_json(self.artifacts / "transcription-report.json", {"asr_model": model, "reference_manuscript": reference_record,
+            "reference_file": reference_file_record,
             "reference_corrected": correction is not None, "correction_count": len(correction["corrections"]) if correction else 0,
             "segments": len(segments), "source_sha256": metadata.get("source_sha256"), "timeline_mode": "original_no_cuts",
             "executor": "original_agent" if model and self.runner.skill_agent is not None else "host_tools"})
         artifacts = [self.artifact(transcript_path, "转写时间轴"), self.artifact(raw_path, "原始识别结果"),
                      self.artifact(caption_path, "Remotion 字幕"), self.artifact(report, "转录与主稿校对报告")]
         if reference_path:
-            artifacts.append(self.artifact(reference_path, "本次使用的口播稿"))
-        return {"status": "completed", "message": f"已校验 {len(segments)} 条真实时间戳字幕，{'已参考当前主稿校对，' if correction is not None and reference_text else ''}时间轴保持原片。", "artifacts": artifacts, "media": {**(self.project.get("media") or {}), "generated_transcript_path": str(transcript_path), "transcript_source_sha256":metadata.get("source_sha256")}}
+            artifacts.append(self.artifact(reference_path, "本次使用的校对参考稿"))
+        media = {**(self.project.get("media") or {}), "generated_transcript_path": str(transcript_path), "transcript_source_sha256":metadata.get("source_sha256")}
+        if plain_supplied:
+            media.update(transcript_path="", transcript_reference_path=str(reference_file))
+        return {"status": "completed", "message": f"已校验 {len(segments)} 条真实时间戳字幕，{'已参考校对稿/当前主稿校对，' if correction is not None and reference_text else ''}时间轴保持原片。", "artifacts": artifacts, "media": media}
 
     async def step_storyboard(self):
         metadata = read_json(self.artifacts / "source-metadata.json")

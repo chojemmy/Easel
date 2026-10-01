@@ -3,15 +3,16 @@ export type WorkflowKind = 'video' | 'article';
 export type WorkflowNodeId = 'brief' | 'script' | 'source' | 'transcript' | 'storyboard' | 'build' | 'review' | 'deliver' | 'publish' | 'archive';
 export interface WorkflowArtifact { name: string; path: string; url?: string; kind?: string; }
 export interface WorkflowRun { id?: string; status?: string; message?: string; started_at?: string; finished_at?: string; log?: string; }
+export interface WorkflowExecution extends WorkflowRun { phase?: string; updated_at?: string; run_id?: string; }
 export interface WorkflowSkillUse { name: string; path: string; sha256?: string; }
 export interface WorkflowFeedback { text: string; created_at?: string; at?: string; target_node?: WorkflowNodeId; }
-export interface WorkflowChatMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'streaming' | 'completed' | 'failed' | 'stopped'; created_at: string; skills_used?: WorkflowSkillUse[]; }
+export interface WorkflowChatMessage { id: string; role: 'user' | 'assistant'; content: string; status: 'streaming' | 'completed' | 'failed' | 'stopped'; created_at: string; skills_used?: WorkflowSkillUse[]; execution?: WorkflowExecution; }
 export interface WorkflowActivity { id: string; kind: 'status' | 'generation' | 'tool' | 'result' | 'error'; text: string; at: string; run_id?: string; }
 export interface WorkflowNode {
   id: WorkflowNodeId; title: string; status: string; message?: string; version: number;
   approved_version?: number; artifacts: WorkflowArtifact[]; runs: WorkflowRun[];
   feedback: WorkflowFeedback[]; skill_version?: string; current_skill_version?: string; skill_updated?: boolean; skill_error?: string;
-  publication_uncertain?: boolean; progress?: number; updated_at?: string;
+  publication_uncertain?: boolean; progress?: number; updated_at?: string; phase?: string;
   chat?: { status: 'idle' | 'running' | 'failed' | 'stopped'; messages: WorkflowChatMessage[]; error?: string; [key: string]: unknown };
   activity?: WorkflowActivity[];
 }
@@ -23,7 +24,7 @@ export interface WorkflowBrief { topic?: string; audience?: string; platform?: s
 export interface WorkflowProject {
   id: string; title: string; kind: WorkflowKind; created_at: string; updated_at: string; content_version: number;
   brief: WorkflowBrief; manuscripts: WorkflowManuscript[]; primary_manuscript_id?: string;
-  media: { source_path?: string; transcript_path?: string; [key: string]: unknown };
+  media: { source_path?: string; transcript_path?: string; transcript_reference_path?: string; [key: string]: unknown };
   nodes: WorkflowNode[]; settings: Record<string, unknown>; archive?: ArchivePreview & { at?: string; outdated?: boolean };
 }
 export interface WorkflowDefinition { id: WorkflowNodeId; title: string; description?: string; skills?: string[]; }

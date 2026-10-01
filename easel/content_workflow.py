@@ -101,6 +101,7 @@ class ContentWorkflowService:
                                 node.update(publication_uncertain=True, message="发布过程被服务重启中断，结果不明；请先到平台核实，不能自动重发。")
                             if node.get("runs"):
                                 node["runs"][-1].update(status="interrupted", message=node["message"], finished_at=now())
+                                self._sync_chat_execution(node, node["runs"][-1])
                             changed = True
                     if changed:
                         write_json(file, project)
@@ -297,12 +298,15 @@ class ContentWorkflowService:
         if dependency and node_of(p, dependency)["status"] != "completed":
             raise WorkflowConflict(f"请先完成并确认“{node_of(p, dependency)['title']}”。")
 
-    async def run(self, project_id: str, node: str, options: dict) -> dict:
+    async def run(self, project_id: str, node: str, options: dict, *, chat_turn_id: str | None = None) -> dict:
         with self._lock:
             options = copy.deepcopy(options)
             p = self.get(project_id)
             self._idle(p)
             n = node_of(p, node)
+            if chat_turn_id is not None and (n.get("chat", {}).get("turn_id") != chat_turn_id or
+                    not any(m.get("id") == chat_turn_id and m.get("role") == "assistant" for m in n["chat"].get("messages", []))):
+                raise WorkflowConflict("对话已更新，未启动旧回复提出的任务。")
             if n["status"] == "skipped":
                 raise ValueError("文章工作流跳过视频节点")
             if node == "archive":
@@ -318,10 +322,14 @@ class ContentWorkflowService:
                 p["content_version"] += 1
             self.invalidate(p, node, "当前节点重新运行，下游需要重新检查。")
             skill = self.skills.get(node)
-            n.update(status="running", message="准备执行…", version=n["version"] + 1, skill_version=skill["version"])
+            n.update(status="running", phase="preparing", message="准备执行…", version=n["version"] + 1, skill_version=skill["version"])
             run = {"id": "run-" + uuid.uuid4().hex[:12], "started_at": now(), "status": "running",
                    "action": action, "content_version": p["content_version"], "skill_version": skill["version"]}
             n["runs"].append(run)
+            if chat_turn_id is not None:
+                run["chat_turn_id"] = chat_turn_id
+                self._sync_chat_execution(n, run)
+            self.activity(p, node, "任务已启动，执行进展和最终结果会同步到对话。", run["id"])
             options["run_id"] = run["id"]
             saved_feedback = [f["text"] for f in n["feedback"] if not f.get("applied_run_id")]
             if saved_feedback:
@@ -330,6 +338,19 @@ class ContentWorkflowService:
             task = asyncio.create_task(self._execute(copy.deepcopy(p), node, options, skill, run["id"]))
             self.tasks[project_id] = task
             return result
+
+    @staticmethod
+    def _sync_chat_execution(node: dict, run: dict) -> None:
+        """Keep the originating reply tied to real execution, including failure."""
+        tid = run.get("chat_turn_id")
+        if not tid:
+            return
+        message = next((m for m in node.get("chat", {}).get("messages", [])
+                        if m.get("id") == tid and m.get("role") == "assistant"), None)
+        if message is not None:
+            message["execution"] = {"run_id": run["id"], "status": run["status"],
+                "phase": node.get("phase", ""), "message": safe_error(run.get("message") or node.get("message", "")),
+                "started_at": run["started_at"], "finished_at": run.get("finished_at"), "updated_at": now()}
 
     def activity(self, project: dict, node: str, event: str | dict, run_id: str = "") -> None:
         item = {"kind": "status", "text": event} if isinstance(event, str) else event
@@ -368,6 +389,10 @@ class ContentWorkflowService:
                     n["message"] = safe_error(message)
                 elif message.get("kind") != "generation":
                     n["message"] = safe_error(message.get("text", ""))
+                if isinstance(message, dict) and message.get("phase") in {"preparing", "transcribing", "correcting", "validating"}:
+                    n["phase"] = message["phase"]
+                n["runs"][-1]["message"] = n["message"]
+                self._sync_chat_execution(n, n["runs"][-1])
                 self.save(p)
 
     async def _execute(self, snapshot: dict, node: str, options: dict, skill: dict, run_id: str):
@@ -397,7 +422,9 @@ class ContentWorkflowService:
                 if result.get("publication_uncertain"):
                     n["publication_uncertain"] = True
                 n["runs"][-1].update(status=n["status"], message=safe_error(n["message"]), finished_at=now())
-                self.activity(p, node, {"kind": "result", "text": n["message"]}, run_id)
+                n["phase"] = "finished"
+                self._sync_chat_execution(n, n["runs"][-1])
+                self.activity(p, node, {"kind": "error" if n["status"] in {"blocked", "failed"} else "result", "text": n["message"]}, run_id)
                 if n["status"] in ("completed", "awaiting_review"):
                     for feedback in n["feedback"]:
                         if not feedback.get("applied_run_id"):
@@ -423,6 +450,8 @@ class ContentWorkflowService:
                     n["publication_uncertain"] = True
                     n["message"] += " 提交结果需要到平台核实，已阻止自动重发。"
                 n["runs"][-1].update(status=status, message=safe_error(n["message"]), finished_at=now())
+                n["phase"] = "finished"
+                self._sync_chat_execution(n, n["runs"][-1])
                 self.activity(p, node, {"kind": "error", "text": n["message"]}, run_id)
                 self.save(p)
 

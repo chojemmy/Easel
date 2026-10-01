@@ -4,6 +4,11 @@
 .cw-assistant-heading p { font-size: 11px; color: #81907c; margin-top: 5px; line-height: 1.6; }
 .cw-assistant-icon { display: grid; place-items: center; color: #396e54; width: 35px; height: 35px; border-radius: 10px; background: #dfeee1; flex-shrink: 0; }
 .cw-assistant-state { font-size: 10px; color: #7a927d; white-space: nowrap; } .cw-assistant-state.is-live { color: #327264; }
+.cw-assistant-state.needs-attention { color: #a4563c; }
+.cw-chat-execution, .cw-execution-summary { margin: 12px 0; border: 1px solid #d7e4d1; background: #f3f8ef; border-radius: 8px; padding: 11px 13px; font-size: 12px; line-height: 1.8; color: #4f7558; overflow-wrap: anywhere; }
+.cw-chat-execution strong, .cw-chat-execution span, .cw-chat-execution small, .cw-execution-summary strong, .cw-execution-summary small { display: block; }
+.cw-chat-execution small, .cw-execution-summary small { color: #889581; font-size: 10px; }
+.cw-execution-blocked, .cw-execution-failed, .cw-execution-stopped, .cw-execution-interrupted, .cw-execution-summary.needs-attention { border-color: #e5d0bd; background: #fff7ed; color: #9a5c39; }
 .cw-assistant-state.is-live::before { content: ''; display: inline-block; width: 6px; height: 6px; background: #4f9678; border-radius: 50%; margin-right: 6px; animation: cw-chat-pulse 1.4s ease-in-out infinite; }
 .cw-chat-thread { max-height: 440px; min-height: 150px; overflow: auto; padding: 18px; overscroll-behavior: contain; background: #fcfdfb; }
 .cw-chat-empty { padding: 13px 5px; color: #63836f; } .cw-chat-empty strong { font-size: 13px; font-weight: 550; }
