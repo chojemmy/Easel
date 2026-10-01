@@ -81,10 +81,11 @@ export default function WorkflowNodeAssistant({ projectId, node, disabled, submi
     else setShowLatest(true);
   }, [context, messages.length, lastMessage?.id, lastMessage?.content, lastMessage?.status, lastMessage?.skills_used?.length, lastMessage?.execution?.status]);
   useEffect(() => {
+    setTick(Date.now());
     if (!executing) return;
     const timer = window.setInterval(() => setTick(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [executing]);
+  }, [executing, context]);
   useLayoutEffect(() => {
     if (followActivity.current && activityThread.current) activityThread.current.scrollTop = activityThread.current.scrollHeight;
   }, [context, lastEvent?.id, lastEvent?.at]);

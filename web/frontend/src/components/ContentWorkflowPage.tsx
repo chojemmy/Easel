@@ -127,7 +127,7 @@ export default function ContentWorkflowPage() {
   const fastPolling = !!project?.nodes.some(running);
   const selectedNode = project?.nodes.find((item) => item.id === nodeId);
   const latestChat = selectedNode?.chat?.messages.at(-1);
-  const libraryRefreshKey = `${selectedNode?.version || 0}:${latestChat?.id || ''}:${latestChat?.status || ''}:${latestChat?.skills_used?.length || 0}`;
+  const libraryRefreshKey = `${selectedNode?.version || 0}:${selectedNode?.status || ''}:${latestChat?.id || ''}:${latestChat?.status || ''}:${latestChat?.skills_used?.length || 0}`;
 
   const markDirty = () => { dirtyRef.current = true; setDirty(true); setArchivePreview(null); };
   const acceptProject = useCallback((value: WorkflowProject, forceDraft = true) => {
