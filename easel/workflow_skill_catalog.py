@@ -286,14 +286,20 @@ class WorkflowSkillCatalog:
         if node is not None and node not in NODES:
             raise WorkflowSkillCatalogError("未知的工作流节点。")
 
-    def list_skills(self, node: str | None = None, *, limit: int = 120) -> list[dict]:
+    def list_skills(self, node: str | None = None, *, limit: int = 120, include_source: bool = False) -> list[dict]:
         self._node(node)
         if type(limit) is not int or not 1 <= limit <= 256:
             raise WorkflowSkillCatalogError("Skill 目录数量上限必须在 1–256 之间。")
         values = [item for item in self._registry().values() if node is None or node in item["stages"]]
         preferred = {"text-polisher": 0, "video-script": 1, "copywriting": 2, "text-condenser": 3}
         values.sort(key=lambda item: (preferred.get(item["name"], 100), item["name"]))
-        return [{key: value for key, value in item.items() if not key.startswith("_")} for item in values[:limit]]
+        result = []
+        for item in values[:limit]:
+            public = {key: value for key, value in item.items() if not key.startswith("_")}
+            if include_source:
+                public["source_path"] = str(_safe_path(item["_root"], "SKILL.md"))
+            result.append(public)
+        return result
 
     def _entry(self, name: str, node: str | None) -> dict:
         self._node(node)

@@ -238,3 +238,12 @@ def test_resolve_source_rechecks_enabled_state_and_returns_only_safe_source(cata
     configure(catalog, {"skills": {"entries": {"text-polisher": {"enabled": False}}}})
     with pytest.raises(WorkflowSkillCatalogError):
         catalog.resolve_source("text-polisher", node="script")
+
+
+def test_native_catalog_provides_current_verified_source_paths_only_when_requested(catalog):
+    directory = install(catalog)
+    assert "source_path" not in catalog.list_skills("script")[0]
+    native = catalog.list_skills("script", include_source=True)
+    assert native[0]["source_path"] == str((directory / "SKILL.md").resolve())
+    configure(catalog, {"skills": {"entries": {"text-polisher": {"enabled": False}}}})
+    assert catalog.list_skills("script", include_source=True) == []

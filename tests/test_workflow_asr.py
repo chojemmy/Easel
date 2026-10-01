@@ -253,7 +253,7 @@ def test_cached_asr_resumes_plan_only_agent_and_uses_complete_typed_reply(transc
             if len(calls) == 1:
                 return {"text": "让我开始分句，准备交付文件。"}
             assert "只有准备/计划文字" in kwargs["instruction"]
-            return {"text": json.dumps(short_phrase_plan(), ensure_ascii=False)}
+            return {"text": json.dumps({"lines": ["今天我分享", "一个省钱方法。", "先用ChatGPT写稿！"], "unsupported_requests": []}, ensure_ascii=False)}
     async def no_command(*args, **kwargs):
         pytest.fail("Cached audio must not spawn ASR again")
     monkeypatch.setattr(runner._Run, "command", no_command)

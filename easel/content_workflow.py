@@ -218,6 +218,8 @@ class ContentWorkflowService:
                     if len({m["id"] for m in normalized}) != len(normalized):
                         raise ValueError("稿件编号不能重复")
                     value = normalized
+                if key == "settings" and "subtitle_max_chars" in value and (type(value["subtitle_max_chars"]) is not int or not 8 <= value["subtitle_max_chars"] <= 40):
+                    raise ValueError("每条字幕字数请设置为 8–40，默认 12 字。")
                 if value == p.get(key):
                     continue
                 start = {"title": "brief", "brief": "brief", "manuscripts": "script", "primary_manuscript_id": "script", "media": "source", "settings": "storyboard"}[key]
@@ -241,7 +243,9 @@ class ContentWorkflowService:
                         # A form sends existing settings back; stale explicit props
                         # must not silently override a newly entered style request.
                         value.pop("visual_parameters", None)
-                    if changed <= {"archive_folder", "media_root"}:
+                    if "subtitle_max_chars" in changed:
+                        start = "transcript"
+                    elif changed <= {"archive_folder", "media_root"}:
                         start = "archive"
                     elif all(k.startswith("publish_") for k in changed):
                         start = "publish"

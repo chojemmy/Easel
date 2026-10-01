@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from .workflow_agent_context import project_memory
-from .workflow_captions import CaptionPlanError, clean_caption_text, spoken_text, timed_words, validate_caption_plan, to_srt
+from .workflow_captions import CaptionPlanError, align_caption_lines, clean_caption_text, spoken_text, timed_words, validate_caption_plan, to_srt
 
 
 class RunnerBlocked(ValueError):
@@ -718,13 +718,16 @@ class _Run:
         target = directory / "subtitle-plan.json"
         task = (f"对当前视频实际录音进行自然语言分句和术语校对，每条不超过 {max_chars} 字，"
             "一条自然短句/完整短语对应一个时间轴，不用机械等字数切割；优先在主谓、并列、转折、停顿处断开，"
-            "不要拆专名、英文单词、数字单位或把语气词单独留一条。每句末尾不得有逗号、句号、感叹号等标点。"
+            "不要拆英文单词、数字单位或把语气词单独留一条。专名尽量完整，长英文短语可在单词间换句。"
+            f"字数包含英文字符及空格，例如「叫做Codex with ChatGPT」超过 {max_chars} 字，须在单词间分成两条。"
+            "每句末尾不得有逗号、句号、感叹号等标点。"
             "根据本轮主稿和校对参考修正明显错词，保留实际说过的内容和口误，不补入未说出的稿件。"
             "不再运行 ASR、不制作分镜、不写或执行任何自制分句脚本；你直接按语义选择词边界。"
             f"读取 word-index.json，列为 [id,word,start,end]，有 {len(words)} 个词；"
-            "from 为首词 id，to 为末词 id + 1（不包含），各项连续从 0 覆盖到词总数，不漏词、不重复。"
-            "不得返回新时间戳；宿主从首尾词的真实 ASR 时间戳计算。"
-            '交付 JSON：{"captions":[{"from":0,"to":5,"text":"自然短句"}],"unsupported_requests":[]}。'
+            "但你只需交付按原录音顺序的自然短句文字，不数词序号、不计算时间戳、不逐词解释。"
+            "不漏词、不重复、保留语气词，不能在同一个 ASR 词内部换句。宿主负责将短句对齐到真实词边界。"
+            '交付 JSON：{"lines":["第一条自然短句","第二条自然短句"],"unsupported_requests":[]}。'
+            "直接交付完整短句列表，不输出冗长的分句推演、数索引过程或自言自语。"
             "分句、去句尾标点、术语校对均已支持，不得列入 unsupported_requests。"
             "若用户要求删改视频才列未支持事项。"
             f"请用原 write 工具将完整 JSON 写入 {target}，最后用中文报告实际条数。"
@@ -762,6 +765,9 @@ class _Run:
             try:
                 if plan is None:
                     raise CaptionPlanError("本轮 Agent 已返回，但没有实际交付分句 JSON；只有准备/计划文字不能完成任务。")
+                if isinstance(plan, dict) and "lines" in plan:
+                    write_json(directory / "agent-proposal.json", plan)
+                    plan = align_caption_lines(plan, words, max_chars)
                 segments = validate_caption_plan(plan, words, metadata["duration"], max_chars)
                 write_json(target, plan)
                 self.caption_plan_path = target
@@ -770,7 +776,10 @@ class _Run:
                 return segments
             except CaptionPlanError as exc:
                 self.notify({"kind": "status", "phase": "segmenting", "text": f"分句校验未通过，接续同一 Agent 修正（{attempt + 1}/3）：{exc}"})
-                repair = f"\n\n宿主校验回执：{exc}。已有 ASR 完成，严禁重新转录。只修正本目录 subtitle-plan.json 的完整分句结果，再实际交付。"
+                repair = (f"\n\n宿主校验回执：{exc}\n已有 ASR 完成，严禁重新转录。"
+                    "一次修正回执列出的全部问题；补回录音实际说出的漏词，调整过长短句和无时间依据的换句。"
+                    "修正后必须实际用 write 覆盖本目录 subtitle-plan.json，或最终正文交付完整的 lines JSON；"
+                    "不能只读取旧文件、复述成功或说准备修正。不要数索引、估计时间或写脚本。")
         raise RunnerBlocked("原始 ASR 已保留，分句结果经 3 次修正仍未通过；请查看本节点的分句校验记录。")
 
     async def step_transcript(self):
