@@ -50,7 +50,7 @@ def test_real_event_source_iterator_exposes_public_text_and_activity_only(case, 
     assert not list(args["directory"].iterdir()), "Adapter must not turn model prose into unvalidated files"
 
 
-def test_sessions_stay_per_project_and_node_with_unique_turns(case):
+def test_sessions_span_nodes_with_unique_turns_and_isolate_projects(case):
     args, root = case
     starts = []
     async def start(**kwargs):
@@ -67,9 +67,34 @@ def test_sessions_stay_per_project_and_node_with_unique_turns(case):
         second = await agent.execute(**args)
         third = await agent.execute(**{**args, "node": "brief"})
         assert first["session_key"] == second["session_key"]
-        assert first["session_key"] != third["session_key"]
+        assert first["session_key"] == third["session_key"] == "workflow-wf-0123456789ab"
+        other = {**args, "project_id": "wf-abcdef012345", "directory": root / "outputs/视频工作流/wf-abcdef012345/artifacts/turn"}
+        fourth = await agent.execute(**other)
+        assert fourth["session_key"] != first["session_key"]
         assert len({first["turn_id"], second["turn_id"], third["turn_id"]}) == 3
     asyncio.run(run())
+
+
+def test_chat_generation_and_skill_execution_share_native_session(case):
+    args, root = case
+    starts, text = [], []
+    async def start(**kwargs):
+        starts.append(kwargs)
+        async def body():
+            yield event("token", "实际正文")
+            yield event("done", {"sessionKey": kwargs["session_id"]})
+        return body()
+    async def stop(**kwargs):
+        pytest.fail("Completed conversation must not cancel")
+    async def run():
+        agent = WorkflowSkillAgent(start, stop, project_root=root)
+        await agent.generate(project_id=args["project_id"], node="brief", prompt="本项目每条字幕12字",
+            system="只输出正文", context={"previous_feedback": "句尾无标点"}, on_text=text.append)
+        await agent.execute(**args)
+    asyncio.run(run())
+    assert text == ["实际正文"]
+    assert starts[0]["session_id"] == starts[1]["session_id"]
+    assert "句尾无标点" in starts[0]["message"] and "统一 Agent 会话" in starts[0]["message"]
 
 
 def test_pins_current_library_source_instead_of_profile_copy(case):

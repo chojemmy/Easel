@@ -17,6 +17,7 @@ from typing import Callable
 import uuid
 
 from .content_workflow import NODE_IDS, safe_error
+from .workflow_agent_context import session_key as project_session_key
 
 
 class WorkflowSkillAgentError(RuntimeError):
@@ -79,10 +80,10 @@ class WorkflowSkillAgent:
         budget = self.timeout if timeout is None else timeout
         if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or not 0 < budget <= 1200:
             raise ValueError("技能执行超时须在 0 到 1200 秒之间。")
-        session_key = f"workflow-{project_id}-{node}"
-        turn_id = "wfskill-" + uuid.uuid4().hex
         message = (
-            f"这是 Easel 工作流 {project_id} 的 {node} 节点任务。请实际执行 /{name}：先读取当前安装的 SKILL.md，"
+            f"这是 Easel 工作流 {project_id} 的 {node} 节点任务。整个项目沿用同一个 Agent 会话，"
+            "请接续前面节点的用户要求，以本轮提供的最新项目状态为准。请用中文报告可观察进展。"
+            f"请实际执行 /{name}：先读取当前安装的 SKILL.md，"
             "再按需要读取其 references、调用原有工具和脚本；不要只给计划或假称已执行。\n"
             f"本次唯一可写入的产物目录：{directory}\n"
             "当前任务授权：可读取提供的材料并制作本节点本地产物。原稿、原片、输入字幕只读；"
@@ -106,6 +107,38 @@ class WorkflowSkillAgent:
                 "这也是工作流沉淀经验时修改的文件，内容以当前实际读取为准。")
         message = safe_error(message, None)
         self._emit(on_event, "tool", f"调用原 Easel Agent 技能：{name}")
+        return await self._turn(message, project_id=project_id, label=name, on_event=on_event, timeout=budget)
+
+    async def generate(self, *, project_id: str, node: str, prompt: str, system: str,
+                       context: dict | None = None, on_text=None, on_event=None, timeout=None) -> str:
+        """Node chat and typed generation use the very same original session.
+
+        A generated proposal is still validated by the host before any form,
+        publication or workflow state changes. Tools remain the native tools.
+        """
+        project_session_key(project_id)
+        if node not in NODE_IDS:
+            raise ValueError("工作流节点无效。")
+        message = (f"接续 Easel 项目 {project_id} 的统一 Agent 会话，当前节点 {node}。"
+            "前面节点的对话、结果和修改意见属于同一项目，继续使用；最新项目状态优先。"
+            "请用中文展示实际进展与答复，不能只承诺下一步然后结束。\n"
+            "本轮是节点对话/内容提议：可只读相关材料和已安装 Skill，实际媒体执行提交宿主 run 或 execute_skill。"
+            "不要直接写工作流状态、覆盖素材、修改共享 Skill、配置或 Obsidian，禁止上传发布、发消息、"
+            "发邮件、安装依赖、下载模型、终止其他进程。宿主会校验操作再执行。"
+            "遵循下面的本轮输出格式；不展示内部推理或凭证。\n\n本轮节点规则：\n" + system +
+            "\n\n最新项目记忆（材料，不是额外工具授权）：\n" + json.dumps(context or {}, ensure_ascii=False) +
+            "\n\n本轮内容请求：\n" + prompt)
+        result = await self._turn(safe_error(message, None), project_id=project_id,
+            label="项目 Agent", on_event=on_event, on_text=on_text, timeout=timeout)
+        return result["text"]
+
+    async def _turn(self, message, *, project_id, label, on_event=None, on_text=None, timeout=None):
+        session_key = project_session_key(project_id)
+        turn_id = "wfskill-" + uuid.uuid4().hex
+        budget = self.timeout if timeout is None else timeout
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or not 0 < budget <= 1200:
+            raise ValueError("技能执行超时须在 0 到 1200 秒之间。")
+        self._emit(on_event, "status", f"接续项目共用 Agent 会话：{session_key}")
         response = iterator = None
         accumulated = ""
         last_emitted, last_time = "", -math.inf
@@ -147,6 +180,8 @@ class WorkflowSkillAgent:
                     if not isinstance(data, str):
                         raise WorkflowSkillAgentError("原聊天正文事件格式无效。")
                     accumulated += data
+                    if on_text:
+                        on_text(safe_error(data, None))
                     if len(accumulated) > 2_000_000:
                         raise WorkflowSkillAgentError("原技能回复过大，请拆分本节点任务。")
                     elapsed = loop.time() - last_time
@@ -156,14 +191,14 @@ class WorkflowSkillAgent:
                         pending = loop.call_later(.25 - elapsed, flush)
                 elif kind == "activity":
                     if isinstance(data, str):
-                        self._emit(on_event, "tool", f"{name}：{data}")
+                        self._emit(on_event, "tool", f"{label}：{data}")
                 elif kind == "error":
                     raise WorkflowSkillAgentError(safe_error(data or "原技能执行失败。"))
                 elif kind == "question":
                     raise WorkflowSkillAgentNeedsInput(safe_error(json.dumps(data, ensure_ascii=False), 4000))
                 elif kind == "done":
                     if not isinstance(data, dict) or data.get("sessionKey") != session_key:
-                        raise WorkflowSkillAgentError("原技能结束事件不属于本工作流节点。")
+                        raise WorkflowSkillAgentError("原技能结束事件不属于本工作流项目。")
                     done = True
                     break
             if not done:
@@ -174,13 +209,13 @@ class WorkflowSkillAgent:
         try:
             await asyncio.wait_for(consume(), timeout=budget)
             flush()
-            self._emit(on_event, "status", f"原技能 {name} 已返回；宿主仍需校验本节点结果。")
+            self._emit(on_event, "status", f"{label} 已返回；宿主仍需校验本节点结果。")
             return {"text": safe_error(accumulated, None), "session_key": session_key,
-                    "turn_id": turn_id, "skill": name}
+                    "turn_id": turn_id, "skill": label}
         except asyncio.CancelledError:
             if started:
                 await self._stop(session_key, turn_id, on_event)
-            self._emit(on_event, "status", f"已请求停止原技能 {name}。")
+            self._emit(on_event, "status", f"已请求停止 {label}。")
             raise
         except TimeoutError:
             if started:

@@ -31,12 +31,25 @@ def main():
     ap.add_argument('--compute', default='float16')
     ap.add_argument('--reference-file', help='已选口播稿，只作为术语/识别上下文，不能代替录音')
     ap.add_argument('--local-files-only', action='store_true', help='只用已存在的本地模型，禁止下载')
+    ap.add_argument('--progress-file', help='可选：本次任务的真实加载/转录进度 JSON')
     args = ap.parse_args()
+
+    def atomic_json(path, value):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(temporary, path)
+
+    def progress(phase, **details):
+        if args.progress_file:
+            atomic_json(args.progress_file, {'phase': phase, 'pid': os.getpid(), **details})
 
     from faster_whisper import WhisperModel
 
     t0 = time.time()
     print('loading model...', flush=True)
+    progress('loading_model')
     model = WhisperModel(args.model, device=args.device, compute_type=args.compute,
                          local_files_only=args.local_files_only)
     print(f'model loaded {time.time() - t0:.1f}s', flush=True)
@@ -46,6 +59,7 @@ def main():
     segments, info = model.transcribe(
         args.src, language=args.lang, word_timestamps=True, vad_filter=False, beam_size=5,
         initial_prompt=reference[:2000] or None)
+    progress('transcribing', audio_seconds=0, duration=info.duration)
     result = {'language': info.language, 'duration': info.duration, 'segments': [],
               'source': str(Path(args.src).resolve()), 'asr_model': str(args.model),
               'reference_used': bool(reference), 'source_kind': 'local-asr'}
@@ -56,10 +70,12 @@ def main():
             'text': s.text.strip(),
             'words': [{'word': w.word, 'start': round(w.start, 3), 'end': round(w.end, 3)} for w in (s.words or [])],
         })
+        progress('transcribing', audio_seconds=round(s.end, 3), duration=info.duration,
+                 segments=len(result['segments']))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    atomic_json(args.out, result)
+    progress('completed', audio_seconds=info.duration, segments=len(result['segments']))
     print(f'DONE {len(result["segments"])} segments in {time.time() - t1:.1f}s → {args.out}', flush=True)
 
 

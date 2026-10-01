@@ -37,6 +37,22 @@ layer: produce
 
 ## 执行步骤
 
+### Easel 工作流内的转录节点
+
+工作流任务须先读取 **video-production / references/workflow-subtitles.md**（本技能相邻
+`../video-production/references/workflow-subtitles.md`）。宿主会把原始识别和语义分句分为两个阶段，
+在整个项目同一个 Agent 会话中接续。
+
+- 原片没变时复用带词级时间戳的原始 ASR；字幕修改意见不再转录一次。
+- TXT/Markdown 与工作流已选主稿是术语校对参考，不能因为缺时间戳拒绝任务。
+- 分句阶段直接按自然语义选择 `word-index.json` 的连续词区间，默认每条 ≤12 字，句尾无标点。
+  一条短句一个时间轴，不能直接采用 ASR 的长段落，也不按字数猜时间。
+- 按宿主要求用 `write` 实际交付 `subtitle-plan.json`，只含词区间与校对后的文字；
+  不另写分句程序、不重复 ASR、不调用烧录/发布。宿主从真实词时间生成 SRT 与 Remotion 字幕。
+- 收到校验失败回执，继续修正同一分句文件；只有计划文字或后台命令启动不算完成。
+
+下方共享 `asr.py` 命令用于独立字幕任务；工作流内优先采用宿主提供的已验证命令和输出路径。
+
 脚本路径（相对项目根）：`skills/shared/scripts/asr.py`、`skills/shared/scripts/video_ops.py`。
 
 ### 1. 生成字幕文件

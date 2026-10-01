@@ -118,7 +118,7 @@ def test_plain_text_is_a_read_only_reference_and_audio_supplies_timestamps(trans
     assert result["media"]["transcript_reference_path"] == str(reference)
     if field == "transcript_path":
         assert result["media"]["transcript_path"] == ""
-    assert any(isinstance(e, dict) and e.get("phase") == "transcribing" for e in events)
+    assert any(isinstance(e, dict) and e.get("phase") == "preparing" for e in events)
 
 
 def test_existing_timestamped_subtitles_keep_their_times_with_reference_file(transcription):
@@ -218,6 +218,86 @@ def test_transcribe_cli_uses_offline_model_and_reference_but_keeps_audio_timesta
     runpy.run_path(str(script), run_name="__main__")
     assert calls[0]["initial_prompt"] == "Remotion 专有名词" and calls[0]["word_timestamps"] is True
     assert json.loads(output.read_text(encoding="utf-8"))["segments"] == [{"start": 1.25, "end": 2.75, "text": "实际音频", "words": []}]
+
+
+def cached_word_recording(root, directory, project, source):
+    metadata = runner.read_json(directory / "artifacts/source-metadata.json")
+    metadata["source_sha256"] = runner.file_sha256(source)
+    runner.write_json(directory / "artifacts/source-metadata.json", metadata)
+    words = [{"word": word, "start": start, "end": end} for word, start, end in
+        [("今天", 1.12, 1.55), ("我", 1.55, 1.69), ("分享", 1.69, 2.14),
+         ("一个", 2.32, 2.62), ("省钱", 2.62, 3.0), ("方法。", 3.0, 3.58),
+         ("先", 5.23, 5.56), ("用", 5.56, 5.68), ("ChatGPT", 5.68, 6.35), ("写稿！", 6.35, 6.99)]]
+    from easel import workflow_asr
+    local = workflow_asr.find_local_model(root)
+    raw = {"source": str(source.resolve()), "source_sha256": metadata["source_sha256"], "asr_model": local["path"],
+        "duration": 10, "segments": [{"start": 1.12, "end": 6.99, "text": "今天我分享一个省钱方法。先用ChatGPT写稿！", "words": words}]}
+    path = runner.write_json(directory / "artifacts/raw-transcript.json", raw)
+    return path, raw
+
+
+def short_phrase_plan():
+    return {"captions": [{"from": 0, "to": 3, "text": "今天我分享"},
+        {"from": 3, "to": 6, "text": "一个省钱方法。"}, {"from": 6, "to": 10, "text": "先用ChatGPT写稿！"}], "unsupported_requests": []}
+
+
+def test_cached_asr_resumes_plan_only_agent_and_uses_complete_typed_reply(transcription, monkeypatch):
+    root, directory, project, _, source = transcription
+    path, raw = cached_word_recording(root, directory, project, source)
+    original_raw = path.read_bytes()
+    calls, events = [], []
+    class Agent:
+        async def execute(self, **kwargs):
+            calls.append(kwargs)
+            assert "command_argv" not in kwargs["context"], "Splitting feedback must not retranscribe audio"
+            if len(calls) == 1:
+                return {"text": "让我开始分句，准备交付文件。"}
+            assert "只有准备/计划文字" in kwargs["instruction"]
+            return {"text": json.dumps(short_phrase_plan(), ensure_ascii=False)}
+    async def no_command(*args, **kwargs):
+        pytest.fail("Cached audio must not spawn ASR again")
+    monkeypatch.setattr(runner._Run, "command", no_command)
+    result = asyncio.run(runner.WorkflowRunner(root, skill_agent=Agent()).execute(project, "transcript",
+        {"feedback": "一句一个时间轴，末尾无标点"}, {}, directory, events.append))
+    assert result["status"] == "completed" and len(calls) == 2
+    assert calls[0]["directory"] == calls[1]["directory"]
+    assert path.read_bytes() == original_raw
+    final = runner.read_json(directory / "artifacts/transcript.json")
+    assert [s["text"] for s in final["segments"]] == ["今天我分享", "一个省钱方法", "先用ChatGPT写稿"]
+    assert [(s["start"], s["end"]) for s in final["segments"]] == [(1.12, 2.14), (2.32, 3.58), (5.23, 6.99)]
+    report = runner.read_json(directory / "artifacts/transcription-report.json")
+    assert report["asr_reused"] and report["timing_source"] == "asr_words" and report["word_count"] == 10
+    assert (directory / "artifacts/subtitles.srt").is_file()
+    assert any(e.get("phase") == "segmenting" for e in events if isinstance(e, dict))
+
+
+def test_incomplete_semantic_results_never_replace_raw_asr_or_enter_workflow(transcription):
+    root, directory, project, _, source = transcription
+    path, raw = cached_word_recording(root, directory, project, source)
+    calls = []
+    class Agent:
+        async def execute(self, **kwargs):
+            calls.append(kwargs)
+            p = short_phrase_plan()
+            p["captions"].pop()
+            runner.write_json(kwargs["directory"] / "subtitle-plan.json", p)
+            return {"text": "已写入分句文件"}
+    result = asyncio.run(runner.WorkflowRunner(root, skill_agent=Agent()).execute(project, "transcript", {}, {}, directory, None))
+    assert result["status"] == "blocked" and len(calls) == 3
+    assert len({str(c["directory"]) for c in calls}) == 1
+    assert not (directory / "artifacts/transcript.json").exists()
+    assert runner.read_json(path) == raw
+
+
+def test_cache_is_rejected_when_recording_changes(transcription):
+    root, directory, project, _, source = transcription
+    cached_word_recording(root, directory, project, source)
+    source.write_bytes(b"a different recording")
+    class Agent:
+        async def execute(self, **kwargs):
+            pytest.fail("Changed source needs ingestion, not a new Agent attempt")
+    result = asyncio.run(runner.WorkflowRunner(root, skill_agent=Agent()).execute(project, "transcript", {}, {}, directory, None))
+    assert result["status"] == "blocked" and "原片文件已变化" in result["message"]
 
 
 def test_execute_step_automatically_receives_same_original_agent_as_chat(tmp_path, monkeypatch):

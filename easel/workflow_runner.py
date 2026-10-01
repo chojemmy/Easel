@@ -24,6 +24,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .workflow_agent_context import project_memory
+from .workflow_captions import CaptionPlanError, clean_caption_text, spoken_text, timed_words, validate_caption_plan, to_srt
+
 
 class RunnerBlocked(ValueError):
     pass
@@ -210,7 +213,7 @@ class _Run:
                 if kind not in {"status", "generation", "tool", "result"}:
                     raise ValueError("未知进度事件类型")
                 event = {"kind": kind, "text": clean_log(str(text.get("text", "")))}
-                if text.get("phase") in {"preparing", "transcribing", "correcting", "validating"}:
+                if text.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating"}:
                     event["phase"] = text["phase"]
                 self.progress(event)
             else:
@@ -361,6 +364,11 @@ class _Run:
         system = "你是文本/JSON编写器，没有工具，不能读取文件或运行命令。Skill中的执行性条款由宿主程序处理；本请求只输出用户prompt指定的文本或JSON产物，不讨论或模拟执行过程。下面保留全部Skill，供内容与偏好遵循：\n\n" + str(self.skill.get("content") or "按输入要求输出，不执行外部动作。")
         if self.library_guidance:
             system += self.library_guidance
+        if callable(getattr(self.runner.skill_agent, "generate", None)):
+            system = ("你是当前项目的统一 Agent。只输出本轮要求的正文或 JSON，实际执行步骤由宿主控制；"
+                "不得用计划或执行报告代替要求的产物。\n" + str(self.skill.get("content") or "") + self.library_guidance)
+            return await self.runner.skill_agent.generate(project_id=self.project["id"], node=self.node,
+                prompt=prompt, system=system, context=project_memory(self.project, self.root), on_event=self.notify)
         # on_text receives final-answer deltas only. The provider adapter owns
         # reasoning/thinking filtering; the runner never receives those fields.
         accumulated = ""
@@ -468,6 +476,8 @@ class _Run:
             "video-script": ("references/retention-scripting-guide.md",),
             "text-polisher": ("references/phrases-to-remove.md", "references/structures-to-avoid.md",
                               "references/zh-ai-markers.md", "references/checklist.md"),
+            "video-production": ("references/workflow-subtitles.md",),
+            "auto-subtitle": ("references/workflow-subtitles.md",),
         }
         documents, remaining = [], 120_000
 
@@ -576,19 +586,64 @@ class _Run:
 
     async def local_transcription(self, metadata, model, reference, reference_path):
         """Use the original Agent when installed, with validated local inputs."""
+        cache_key = {"source_sha256": metadata.get("source_sha256"), "model": str(Path(model["path"]).resolve())}
+        cache_file = self.artifacts / "asr-cache.json"
+        candidates = []
+        if cache_file.is_file() and not cache_file.is_symlink():
+            try:
+                cache = read_json(cache_file)
+                if cache.get("key") == cache_key:
+                    candidates.append((Path(cache["path"]), cache.get("sha256")))
+            except (KeyError, ValueError, OSError, TypeError):
+                pass
+        # Upgrade older completed recordings without repeating ASR. Their host
+        # snapshot already binds raw audio recognition to the source hash.
+        legacy = self.artifacts / "raw-transcript.json"
+        if legacy.is_file() and not legacy.is_symlink():
+            try:
+                data = read_json(legacy)
+                if data.get("source_sha256") == cache_key["source_sha256"] and data.get("asr_model") and Path(data["asr_model"]).resolve() == Path(model["path"]).resolve():
+                    candidates.append((legacy, None))
+            except (ValueError, TypeError, OSError):
+                pass
+        for candidate, digest in candidates:
+            try:
+                if candidate.is_symlink() or not candidate.resolve().is_relative_to(self.artifacts.resolve()) or not candidate.is_file():
+                    continue
+                if digest and await asyncio.to_thread(file_sha256, candidate) != digest:
+                    continue
+                data = read_json(candidate)
+                if Path(data.get("source", "")).resolve() != Path(metadata["source_path"]).resolve() or abs(float(data.get("duration", 0)) - metadata["duration"]) > .1:
+                    continue
+                validate_transcript(data, metadata["duration"])
+                if not timed_words(data, metadata["duration"]):
+                    continue
+                if await asyncio.to_thread(file_sha256, Path(metadata["source_path"])) != cache_key["source_sha256"]:
+                    raise RunnerBlocked("原片文件已变化，请重新运行素材检查；不能复用旧录音字幕。")
+                write_json(cache_file, {"key": cache_key, "path": str(candidate), "sha256": await asyncio.to_thread(file_sha256, candidate)})
+                self.notify({"kind": "tool", "phase": "correcting", "text": "已按原片哈希复用真实 ASR 和词级时间戳；本次只校对与重新分句，不重复转录视频。"})
+                self.asr_reused = True
+                return candidate, None
+            except RunnerBlocked:
+                raise
+            except (CaptionPlanError, ValueError, TypeError, OSError):
+                continue
         target_dir = self.artifacts / ("agent-transcript-" + uuid.uuid4().hex[:12])
         target_dir.mkdir(parents=True)
         target = target_dir / "transcript.json"
         args = [self.python, str(self.runner.sdk / "tools/transcribe.py"), "--src", metadata["source_path"],
-                "--out", str(target), "--model", model["path"], "--device", "cpu", "--compute", "int8", "--local-files-only"]
+                "--out", str(target), "--model", model["path"], "--device", "cpu", "--compute", "int8", "--local-files-only",
+                "--progress-file", str(target_dir / "progress.json")]
         if reference_path:
             args += ["--reference-file", str(reference_path)]
         correction = None
         if self.runner.skill_agent is None:
+            self.asr_executor = "host_skill_script"
             self.notify({"kind": "status", "phase": "transcribing", "text": "正在运行本地 ASR，根据视频音轨生成真实时间戳…"})
             await self.command(args, timeout=7200, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
                                label=f"本地 ASR：{model['name']}（已缓存、离线）")
         else:
+            self.asr_executor = "original_agent"
             from .workflow_skill_catalog import WorkflowSkillCatalog
             catalog = WorkflowSkillCatalog(self.root)
             source = catalog.resolve_source("video-production", node="transcript")
@@ -597,19 +652,19 @@ class _Run:
                 "然后实际运行 context.command_argv 给出的项目解释器与转录脚本；这是已验证的完整本地模型。"
                 "使用 --local-files-only，禁止安装依赖、下载模型或改用云端；禁止猜测、均分或按字数估算时间戳。"
                 "transcript.json 必须由该脚本根据原录音生成，保持原始 ASR 文字和时间戳，不修改它来伪装校对。"
-                "如果有参考主稿或修改意见，另外在产物目录写 corrections.json："
-                '{"corrections":[{"index":0,"text":"校正后的整段文字"}],"unsupported_requests":[]}。'
-                "只修明确的错词、专名、标点；index 为原转录零基序号。不改时间、不删句、不把未说出的稿件补进去、"
-                "不把口播改写成文章。不确定的差异保留录音原文；没有确需修正的项时写空列表。"
-                "宿主会验证并应用 corrections，不能直接修改工作流主稿、状态或确认记录。"
+                "本轮只需交付原始 transcript.json（必须包含 words），不要写分句脚本、不要剪辑或校对。"
+                "宿主下一阶段会在同一 Agent 会话中继续语义分句和术语校对。"
+                "如果命令返回 process sessionId，必须用 process 继续等待自己启动的任务至完成，不能只报告后台已启动。"
+                "结果文件未生成之前不能以计划作为最终答复；读取技能和准备命令不代表已经转录。"
             )
             self.notify({"kind": "tool", "text": "转录本步已接入原 Easel Agent，将读取主稿并调用本地 ASR 工具。"})
-            self.notify({"kind": "status", "phase": "transcribing", "text": "正在由原 Agent 调用本地 ASR，根据视频音轨生成真实时间戳…"})
+            self.notify({"kind": "status", "phase": "preparing", "text": "原 Agent 正在准备本地 ASR 工具；脚本开始后才会显示转录进度。"})
             execution = asyncio.create_task(self.runner.skill_agent.execute(project_id=self.project["id"], node="transcript",
                 skill={"name": "video-production", "layer": "produce", "source_path": str(source)},
                 instruction=task, directory=target_dir,
                 context={"command_argv": args, "reference_path": str(reference_path) if reference_path else "",
                          "reference_manuscript": reference, "feedback": self.options.get("feedback", ""),
+                         "project_memory": project_memory(self.project, self.root),
                          "duration": metadata["duration"], "asr_model": model, "node_standard": self.skill.get("content", "")},
                 on_event=self.notify, timeout=1200))
             started = time.monotonic()
@@ -618,28 +673,111 @@ class _Run:
                     done, _ = await asyncio.wait({execution}, timeout=10)
                     if not done:
                         produced = target.is_file()
-                        self.notify({"kind": "status", "phase": "correcting" if produced else "transcribing",
-                            "text": ("ASR 字幕文件已生成，正在校对文字并等待原 Agent 交付结果" if produced else "本地 ASR 任务仍在执行，正在等待带时间戳的字幕文件") + f"（本次已等待 {int(time.monotonic() - started)} 秒）。"})
+                        marker = target_dir / "progress.json"
+                        state = read_json(marker) if marker.is_file() and not marker.is_symlink() else {}
+                        transcribing = state.get("phase") == "transcribing"
+                        self.notify({"kind": "status", "phase": "correcting" if produced else "transcribing" if transcribing else "preparing",
+                            "text": ("ASR 字幕文件已生成，正在等待原 Agent 返回" if produced else
+                                f"本地 ASR 正在转录，已识别至 {state.get('audio_seconds', 0)} 秒" if transcribing else
+                                "正在等待原 Agent 准备/加载 ASR，尚未收到转录开始回执") + f"（已等待 {int(time.monotonic() - started)} 秒）。"})
                 await execution
             finally:
                 if not execution.done():
                     execution.cancel()
                     await asyncio.gather(execution, return_exceptions=True)
-            if reference or self.options.get("feedback"):
-                correction_path = target_dir / "corrections.json"
-                if correction_path.is_symlink() or not correction_path.is_file():
-                    raise RunnerBlocked("原 Agent 尚未交付主稿校对结果，原始转录保留；请查看执行记录。")
-                correction = read_json(correction_path)
+            if not target.exists():
+                self.asr_executor = "host_skill_script_after_incomplete_agent"
+                # Planning prose is never a receipt. Stable ASR needs no model
+                # judgment, so finish using the exact installed Skill command.
+                self.notify({"kind": "tool", "phase": "transcribing", "text": "原 Agent 已结束但没有交付 ASR 文件；正在补执行同一 Skill 的固定本地命令，完成后继续 Agent 校对。"})
+                await self.command(args, timeout=7200, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+                    label=f"本地 ASR 补执行：{model['name']}（离线）")
+            correction_path = target_dir / "corrections.json"
+            if correction_path.is_file() and not correction_path.is_symlink():
+                correction = read_json(correction_path)  # Older adapters may supply it.
         if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(target_dir.resolve()):
             raise RunnerBlocked("转录工具未交付本次项目内的真实字幕文件。")
         data = read_json(target)
-        if data.get("source") != str(Path(metadata["source_path"]).resolve()):
+        if Path(data.get("source", "")).resolve() != Path(metadata["source_path"]).resolve():
             raise RunnerBlocked("转录结果没有匹配本次原片，未应用。")
         validate_transcript(data, metadata["duration"])
+        write_json(cache_file, {"key": cache_key, "path": str(target), "sha256": await asyncio.to_thread(file_sha256, target)})
         return target, correction
+
+    async def semantic_captions(self, raw_data, metadata, reference):
+        words = timed_words(raw_data, metadata["duration"])
+        if not words:
+            return None
+        max_chars = (self.project.get("settings") or {}).get("subtitle_max_chars", 12)
+        if type(max_chars) is not int or not 8 <= max_chars <= 40:
+            raise RunnerBlocked("每条字幕字数请设置为 8–40，默认 12 字。")
+        directory = self.artifacts / ("agent-captions-" + uuid.uuid4().hex[:12])
+        directory.mkdir()
+        input_path = directory / "word-index.json"
+        input_path.write_text(json.dumps([[w["id"], w["word"], w["start"], w["end"]] for w in words], ensure_ascii=False), encoding="utf-8")
+        target = directory / "subtitle-plan.json"
+        task = (f"对当前视频实际录音进行自然语言分句和术语校对，每条不超过 {max_chars} 字，"
+            "一条自然短句/完整短语对应一个时间轴，不用机械等字数切割；优先在主谓、并列、转折、停顿处断开，"
+            "不要拆专名、英文单词、数字单位或把语气词单独留一条。每句末尾不得有逗号、句号、感叹号等标点。"
+            "根据本轮主稿和校对参考修正明显错词，保留实际说过的内容和口误，不补入未说出的稿件。"
+            "不再运行 ASR、不制作分镜、不写或执行任何自制分句脚本；你直接按语义选择词边界。"
+            f"读取 word-index.json，列为 [id,word,start,end]，有 {len(words)} 个词；"
+            "from 为首词 id，to 为末词 id + 1（不包含），各项连续从 0 覆盖到词总数，不漏词、不重复。"
+            "不得返回新时间戳；宿主从首尾词的真实 ASR 时间戳计算。"
+            '交付 JSON：{"captions":[{"from":0,"to":5,"text":"自然短句"}],"unsupported_requests":[]}。'
+            "分句、去句尾标点、术语校对均已支持，不得列入 unsupported_requests。"
+            "若用户要求删改视频才列未支持事项。"
+            f"请用原 write 工具将完整 JSON 写入 {target}，最后用中文报告实际条数。"
+            "也可直接在最终正文输出完整 JSON，宿主会验证；仅说准备执行或给计划不能算交付。")
+        context = {"word_index_path": str(input_path), "reference_manuscript": reference,
+            "feedback": self.options.get("feedback", ""), "project_memory": project_memory(self.project, self.root),
+            "raw_segments": [{"text": s["text"], "start": s["start"], "end": s["end"]} for s in raw_data["segments"]]}
+        from .workflow_skill_catalog import WorkflowSkillCatalog, WorkflowSkillCatalogError
+        catalog = WorkflowSkillCatalog(self.root)
+        try:
+            name = "auto-subtitle"
+            source = catalog.resolve_source(name, node="transcript")
+        except WorkflowSkillCatalogError:
+            name = "video-production"
+            source = catalog.resolve_source(name, node="transcript") if self.runner.skill_agent is not None else None
+        self.notify({"kind": "status", "phase": "segmenting", "text": f"正在让项目 Agent 按语义分句、校对术语（每条 ≤{max_chars} 字、无句尾标点），时间取自 {len(words)} 个 ASR 词。"})
+        repair = ""
+        for attempt in range(3):
+            if self.runner.skill_agent is not None:
+                result = await self.runner.skill_agent.execute(project_id=self.project["id"], node="transcript",
+                    skill={"name": name, "layer": "produce", "source_path": str(source)}, directory=directory,
+                    instruction=task + repair, context=context, on_event=self.notify, timeout=1200)
+                plan = None
+                try:
+                    plan = parse_json_reply(result)
+                except RunnerBlocked:
+                    pass
+                if plan is None and target.is_file() and not target.is_symlink():
+                    try:
+                        plan = read_json(target)
+                    except (ValueError, OSError):
+                        pass
+            else:
+                plan = parse_json_reply(await self.model(task + repair + "\n只返回完整 JSON。词索引：" + input_path.read_text(encoding="utf-8") + "\n参考稿：" + reference))
+            try:
+                if plan is None:
+                    raise CaptionPlanError("本轮 Agent 已返回，但没有实际交付分句 JSON；只有准备/计划文字不能完成任务。")
+                segments = validate_caption_plan(plan, words, metadata["duration"], max_chars)
+                write_json(target, plan)
+                self.caption_plan_path = target
+                self.caption_max_chars = max_chars
+                self.notify({"kind": "result", "text": f"语义分句已校验：{len(segments)} 条，完整覆盖 {len(words)} 个词；每条 ≤{max_chars} 字，句尾无标点。"})
+                return segments
+            except CaptionPlanError as exc:
+                self.notify({"kind": "status", "phase": "segmenting", "text": f"分句校验未通过，接续同一 Agent 修正（{attempt + 1}/3）：{exc}"})
+                repair = f"\n\n宿主校验回执：{exc}。已有 ASR 完成，严禁重新转录。只修正本目录 subtitle-plan.json 的完整分句结果，再实际交付。"
+        raise RunnerBlocked("原始 ASR 已保留，分句结果经 3 次修正仍未通过；请查看本节点的分句校验记录。")
 
     async def step_transcript(self):
         metadata = read_json(self.artifacts / "source-metadata.json")
+        source_hash = metadata.get("source_sha256", "")
+        if re.fullmatch(r"[a-f0-9]{64}", source_hash) and await asyncio.to_thread(file_sha256, Path(metadata["source_path"])) != source_hash:
+            raise RunnerBlocked("原片文件已变化，请重新运行素材检查；不能使用旧时间轴。")
         supplied = self.file_setting("transcript_path", False)
         reference_file = self.file_setting("transcript_reference_path", False)
         plain_supplied = supplied is not None and supplied.suffix.lower() in {".txt", ".md"}
@@ -689,8 +827,9 @@ class _Run:
             if supplied.suffix.lower() not in {".srt", ".vtt", ".json"}:
                 raise RunnerBlocked("请提供带时间戳的 SRT/VTT/JSON，或 TXT/Markdown 校对稿以从视频生成字幕。")
             if supplied.suffix.lower() == ".json":
-                segments = validate_transcript(read_json(supplied), metadata["duration"])
-                normalized = write_json(self.artifacts / "imported-transcript.json", {"segments": segments, "duration": metadata["duration"]})
+                imported = read_json(supplied)
+                validate_transcript(imported, metadata["duration"])
+                normalized = write_json(self.artifacts / "imported-transcript.json", {**imported, "duration": metadata["duration"]})
                 state["config"]["transcript"] = str(normalized)
             else:
                 state["config"]["transcript"] = str(supplied)
@@ -712,11 +851,33 @@ class _Run:
         await self.sdk_command("stage", "transcribe", "--run-dir", self.sdk_run, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
         raw_data = read_json(self.sdk_run / "artifacts/transcript.json")
         segments = validate_transcript(raw_data, metadata["duration"])
+        max_chars = (self.project.get("settings") or {}).get("subtitle_max_chars", 12)
+        if type(max_chars) is not int or not 8 <= max_chars <= 40:
+            raise RunnerBlocked("每条字幕字数请设置为 8–40，默认 12 字。")
+        if not timed_words(raw_data, metadata["duration"]) and any(len(clean_caption_text(s["text"])) > max_chars for s in segments):
+            if not supplied:
+                raise RunnerBlocked("ASR 未交付完整词级时间戳，不能把长段落当字幕或按字数猜时间，请检查转录工具。")
+            from .workflow_asr import find_local_model
+            model = await asyncio.to_thread(find_local_model, self.root, settings=self.project.get("settings"), options=self.options)
+            if model is None:
+                raise RunnerBlocked("提供的长字幕没有词级时间戳，无法安全拆分；需要现有本地 ASR 从原视频对齐词时间。")
+            self.notify({"kind": "tool", "text": "输入字幕只有长段落时间，没有词级时间；将从原视频生成真实词时间以便自然分句。"})
+            local_transcript, correction = await self.local_transcription(metadata, model, reference_text, reference_path)
+            state["config"]["transcript"] = str(local_transcript)
+            state["stages"]["transcribe"] = {"status": "pending"}
+            write_json(state_path, state)
+            await self.sdk_command("stage", "transcribe", "--run-dir", self.sdk_run, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+            raw_data = read_json(self.sdk_run / "artifacts/transcript.json")
+            segments = validate_transcript(raw_data, metadata["duration"])
         raw_path = write_json(self.artifacts / "raw-transcript.json", {**raw_data, "duration": metadata["duration"], "source_sha256": metadata.get("source_sha256")})
-        if correction is None and (self.options.get("feedback") or (not supplied and reference_text)):
+        semantic = await self.semantic_captions(raw_data, metadata, reference_text)
+        if semantic is not None:
+            segments = semantic
+            correction = None  # The checked phrase plan also contains corrections.
+        elif correction is None and (self.options.get("feedback") or (not supplied and reference_text)):
             self.notify({"kind": "status", "phase": "correcting", "text": "音频转录已完成，正在结合校对稿与主稿修正错词、专名和标点…"})
             correction = parse_json_reply(await self.model("结合已选主稿和修改意见，仅校正转录错词/专有名词/标点。主稿是参考而非实际说出的文字；不得插入未说出的稿件，不能改时间戳、删句、粗剪、增编台词或改原意。不确定时保留录音原文。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests。参考主稿：" + reference_text + "\n实际转录：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False)))
-        if correction is not None:
+        if correction is not None and semantic is None:
             if not isinstance(correction,dict) or set(correction) != {"corrections","unsupported_requests"} or not isinstance(correction["corrections"],list) or not isinstance(correction["unsupported_requests"],list):
                 raise RunnerBlocked("字幕校正必须返回 corrections 和 unsupported_requests 两个列表。")
             if correction["unsupported_requests"]:
@@ -729,23 +890,42 @@ class _Run:
                 segments[item["index"]]["text"] = item["text"].strip()
             segments = validate_transcript({"segments":segments},metadata["duration"])
             self.notify({"kind": "result", "text": f"已依据主稿/修改意见校对 {len(correction['corrections'])} 条字幕，保留全部原录音时间戳。"})
-        self.notify({"kind": "status", "phase": "validating", "text": "文字校对已完成，正在校验时间戳并保存字幕与报告…"})
+        segments = [{**s, "text": clean_caption_text(s["text"])} for s in segments]
+        validate_transcript({"segments": segments}, metadata["duration"])
+        if any(len(s["text"]) > max_chars for s in segments):
+            raise RunnerBlocked(f"校对后的字幕超过 {max_chars} 字，但没有完整词级时间可继续分句；原始结果保留。")
+        self.notify({"kind": "status", "phase": "validating", "text": "语义分句与校对已完成，正在检查完整词覆盖、句尾标点和时间戳并保存字幕…"})
         transcript_path = write_json(self.artifacts / "transcript.json", {"segments": segments, "duration": metadata["duration"], "source_sha256":metadata.get("source_sha256"), "timeline_mode": "original_no_cuts"})
         captions = [{"text": s["text"], "startMs": round(s["start"] * 1000), "endMs": round(s["end"] * 1000), "timestampMs": None, "confidence": None} for s in segments]
         caption_path = write_json(self.artifacts / "captions.json", captions)
+        srt_path = self.artifacts / "subtitles.srt"
+        srt_path.write_text(to_srt(segments), encoding="utf-8")
+        preview_path = self.artifacts / "subtitle-preview.md"
+        preview_path.write_text("# 字幕分句预览\n\n一条短句对应一个真实时间轴，句尾无标点。\n\n| 序号 | 开始（秒） | 结束（秒） | 字幕 |\n|---|---:|---:|---|\n" +
+            "\n".join(f"| {i + 1} | {s['start']:.3f} | {s['end']:.3f} | {s['text'].replace('|', '／')} |" for i, s in enumerate(segments)) + "\n", encoding="utf-8")
+        words = timed_words(raw_data, metadata["duration"])
+        correction_count = sum(spoken_text(s["text"]) != spoken_text("".join(w["word"] for w in words[s["word_from"]:s["word_to"]])) for s in segments) if semantic else len(correction["corrections"]) if correction else 0
         report = write_json(self.artifacts / "transcription-report.json", {"asr_model": model, "reference_manuscript": reference_record,
             "reference_file": reference_file_record,
-            "reference_corrected": correction is not None, "correction_count": len(correction["corrections"]) if correction else 0,
+            "reference_corrected": semantic is not None or correction is not None, "correction_count": correction_count,
+            "asr_reused": getattr(self, "asr_reused", False), "raw_segments": len(raw_data["segments"]),
+            "asr_executor": "cached" if getattr(self, "asr_reused", False) else getattr(self, "asr_executor", "imported_subtitles"),
+            "word_count": len(words), "subtitle_max_chars": max_chars, "trailing_punctuation": False,
+            "timing_source": "asr_words" if semantic else "existing_segments", "semantic_segmentation": semantic is not None,
+            "agent_session_key": project_memory(self.project)["session_key"] if self.runner.skill_agent is not None else None,
             "segments": len(segments), "source_sha256": metadata.get("source_sha256"), "timeline_mode": "original_no_cuts",
             "executor": "original_agent" if model and self.runner.skill_agent is not None else "host_tools"})
         artifacts = [self.artifact(transcript_path, "转写时间轴"), self.artifact(raw_path, "原始识别结果"),
-                     self.artifact(caption_path, "Remotion 字幕"), self.artifact(report, "转录与主稿校对报告")]
+                     self.artifact(caption_path, "Remotion 字幕"), self.artifact(srt_path, "分句字幕 SRT"),
+                     self.artifact(preview_path, "字幕分句预览"), self.artifact(report, "转录与主稿校对报告")]
+        if getattr(self, "caption_plan_path", None):
+            artifacts.append(self.artifact(self.caption_plan_path, "Agent 语义分句与校对方案"))
         if reference_path:
             artifacts.append(self.artifact(reference_path, "本次使用的校对参考稿"))
         media = {**(self.project.get("media") or {}), "generated_transcript_path": str(transcript_path), "transcript_source_sha256":metadata.get("source_sha256")}
         if plain_supplied:
             media.update(transcript_path="", transcript_reference_path=str(reference_file))
-        return {"status": "completed", "message": f"已校验 {len(segments)} 条真实时间戳字幕，{'已参考校对稿/当前主稿校对，' if correction is not None and reference_text else ''}时间轴保持原片。", "artifacts": artifacts, "media": media}
+        return {"status": "completed", "message": f"已生成 {len(segments)} 条短句字幕，每条 ≤{max_chars} 字、句尾无标点；{'时间来自 ASR 词级对齐，' if semantic else ''}{'已参考当前主稿/校对稿，' if reference_text else ''}{'复用了原始 ASR，' if getattr(self, 'asr_reused', False) else ''}原片保持不变。", "artifacts": artifacts, "media": media}
 
     async def step_storyboard(self):
         metadata = read_json(self.artifacts / "source-metadata.json")

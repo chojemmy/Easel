@@ -2715,14 +2715,14 @@ async def api_chat_stop(req: StopRequest):
 
 
 # Workflow execution reuses the exact original chat supervisor, tool runtime and
-# event stream. Dedicated session IDs keep it separate from ordinary chats.
+# event stream. One dedicated session per project spans all nodes and chats.
 async def _workflow_agent_start(*, message: str, session_id: str, turn_id: str):
     _WORKFLOW_AGENT_TURNS[session_id] = turn_id
     return await api_chat_stream(ChatRequest(message=message, sessionId=session_id, turnId=turn_id))
 
 
 async def _workflow_agent_stop(*, session_id: str, turn_id: str):
-    # An old cancellation must never terminate a newer run in the same node.
+    # An old cancellation must never terminate a newer turn in the same project.
     if _WORKFLOW_AGENT_TURNS.get(session_id) != turn_id:
         return {"stopped": False}
     _WORKFLOW_STOP_REQUESTS.add((session_id, turn_id))

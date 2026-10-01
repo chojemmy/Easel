@@ -121,6 +121,8 @@ class ContentWorkflowService:
             return json.loads(path.read_text(encoding="utf-8"))
 
     def save(self, project: dict) -> dict:
+        from .workflow_agent_context import session_key
+        project["agent_session_key"] = session_key(project["id"])
         project["updated_at"] = now()
         write_json(self.directory(project["id"]) / "project.json", project)
         return copy.deepcopy(project)
@@ -389,7 +391,7 @@ class ContentWorkflowService:
                     n["message"] = safe_error(message)
                 elif message.get("kind") != "generation":
                     n["message"] = safe_error(message.get("text", ""))
-                if isinstance(message, dict) and message.get("phase") in {"preparing", "transcribing", "correcting", "validating"}:
+                if isinstance(message, dict) and message.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating"}:
                     n["phase"] = message["phase"]
                 n["runs"][-1]["message"] = n["message"]
                 self._sync_chat_execution(n, n["runs"][-1])
