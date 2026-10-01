@@ -16,6 +16,7 @@ from .content_workflow import WorkflowConflict, node_of, now, safe_error
 from .workflow_model import WorkflowModel
 from .workflow_skill_catalog import WorkflowSkillCatalog
 from .workflow_agent_context import project_memory
+from .workflow_skill_agent import WorkflowSkillAgentTruncated
 
 SETTINGS = {
     "transcript": {"subtitle_max_chars"},
@@ -140,8 +141,17 @@ def parse_reply(raw: str) -> dict:
 
 
 def context_for(project: dict, node: str, extra: list, catalog: list | None = None,
-                tool_results: list | None = None, agent_available: bool = False) -> str:
+                tool_results: list | None = None, agent_available: bool = False, *, native: bool = False) -> str:
     n = node_of(project, node)
+    if native:
+        # Latest saved facts are passed once in generate(context=...). Native
+        # session history must not grow by replaying itself inside every prompt.
+        messages = n.get("chat", {}).get("messages", [])
+        request = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        return json.dumps({"node": {k: n.get(k) for k in ("id", "title", "status", "message")},
+            "request": request, "retrieved_notes": extra,
+            "available_skills": [{k: s[k] for k in ("name", "description", "source_path") if k in s} for s in catalog or []],
+            "tool_results": tool_results or [], "original_agent_available": True}, ensure_ascii=False)
     context = {"node": {k: n.get(k) for k in ("id", "title", "status", "message")},
                "title": project["title"], "brief": project["brief"], "settings": project["settings"],
                "media": project["media"], "primary_manuscript_id": project.get("primary_manuscript_id"),
@@ -334,10 +344,28 @@ async def execute_chat(service, pid: str, node: str, tid: str, user_text: str, v
         if available:
             status(f"已连接 Easel 原技能库，本节点可选择 {len(available)} 项技能。")
         async def generate_reply(prompt, system, *, on_text=None, **options):
+            nonlocal raw, last_flush
             if callable(getattr(delegate, "generate", None)):
-                return await delegate.generate(project_id=pid, node=node, prompt=prompt, system=system,
-                    context=project_memory(service.get(pid), service.root), on_text=on_text,
-                    on_event=lambda event: status(event) if event.get("kind") != "generation" else None)
+                for attempt in range(2):
+                    try:
+                        return await delegate.generate(project_id=pid, node=node, prompt=prompt, system=system,
+                            context=project_memory(service.get(pid), service.root, compact=True), on_text=on_text,
+                            on_event=lambda event: status(event) if event.get("kind") != "generation" else None, **options)
+                    except WorkflowSkillAgentTruncated:
+                        if attempt:
+                            raise
+                        # Only retry read-only proposal generation. Skill/media
+                        # execution is never silently repeated after a partial run.
+                        raw, last_flush = "", 0.0
+                        with service._lock:
+                            current = service.get(pid); owner = node_of(current, node)["chat"]
+                            if owner.get("turn_id") != tid or owner.get("status") != "running":
+                                return ""
+                            owner["messages"][-1]["content"] = ""
+                            service.save(current)
+                        status({"kind": "status", "text": "原 Agent 的生成被截断；保持同一项目会话，正在重新生成完整答复（1/1）…"})
+                        options = {**options, "generation_budget": "maximum", "max_tokens": None}
+                        system += "\n上一轮因length被截断，不是操作格式错误。使用最新项目状态，重新给出完整中文答复和操作块；不要重复半句或仅道歉。"
             return await WorkflowModel().generate(prompt, system=system, on_text=on_text,
                 on_status=status, **options)
         for turn in range(10):
@@ -345,7 +373,7 @@ async def execute_chat(service, pid: str, node: str, tid: str, user_text: str, v
             if node_of(p, node)["chat"].get("status") != "running" or node_of(p, node)["chat"].get("turn_id") != tid:
                 return
             status("正在结合已读取的技能和材料生成…" if tool_results else "正在选择适用技能、生成回复…")
-            output = await generate_reply(context_for(p, node, notes, available, tool_results, delegate is not None), system=node_instructions,
+            output = await generate_reply(context_for(p, node, notes, available, tool_results, delegate is not None, native=native), system=node_instructions,
                 on_text=on_text, generation_budget=p["settings"].get("generation_budget", "large"))
             try:
                 result = parse_reply(output)

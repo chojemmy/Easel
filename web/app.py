@@ -1680,6 +1680,7 @@ class ChatRequest(BaseModel):
     persona: str | None = None
     sessionId: str | None = None
     turnId: str | None = None
+    maxTokens: int | None = Field(default=None, ge=256, le=1048576)
     attachments: list[AttachmentRef] = Field(default_factory=list)
 
 
@@ -2036,6 +2037,10 @@ async def api_chat_stream(req: ChatRequest):
         full_text: list[str] = []        # 累积完整回答，供断线取回
         timed_out = False                # 只有真·超时才 terminate 进程；断线绝不杀
 
+        run_info: dict = {"stop_reason": None, "last_ev": None, "saw_message_end": False,
+                          "run_id": None, "fetch_count": 0, "token_chars": 0, "thinking_chars": 0,
+                          "delegated": False, "ignored_foreign_events": 0, "error": False}
+
         # Claim this turn before waiting for locks, so recovery cannot return the previous turn.
         _save_turn(pk, "running", "", {"turn_id": turn_id})
 
@@ -2049,7 +2054,9 @@ async def api_chat_stream(req: ChatRequest):
         def to_client(kind, text=None, **extra):
             nonlocal event_seq
             event_seq += 1
-            data = ({"sessionKey": extra.get("sessionKey")} if kind == "done" else text)
+            if kind == "error":
+                run_info["error"] = True
+            data = extra if kind == "done" else text
             event = {"id": event_seq, "event": kind, "data": data}
             try:
                 with event_path.open("a", encoding="utf-8") as ef:
@@ -2074,6 +2081,8 @@ async def api_chat_stream(req: ChatRequest):
                 "stream": True,
                 "messages": [{"role": "user", "content": message}],
             }
+            if req.maxTokens is not None:
+                body["max_tokens"] = req.maxTokens
             # session-id 必须跟 CLI 路径钉死同一个（见 _openclaw_session_id）：只带 session-key
             # 的话网关会自己另起一个 transcript —— 跨天空闲后丢历史，且万一本轮回退 CLI，
             # 两条路径会写进不同的会话文件，对话历史直接劈叉。
@@ -2105,10 +2114,15 @@ async def api_chat_stream(req: ChatRequest):
                             except ValueError:
                                 continue
                             tool_activity.bind_run(d.get("id"))
+                            if tool_activity.run_id is not None:
+                                run_info["run_id"] = tool_activity.run_id
                             if isinstance(d.get("error"), dict):   # 200 里夹错误对象：不能当正常流吞掉
                                 to_client("error", f"❌ 网关返回错误：{str(d['error'])[:160]}")
                                 return
-                            delta = (d.get("choices") or [{}])[0].get("delta") or {}
+                            choice = (d.get("choices") or [{}])[0]
+                            delta = choice.get("delta") or {}
+                            if choice.get("finish_reason"):
+                                run_info["stop_reason"] = choice["finish_reason"]
                             # 思考流的两个可能来源，先到先得（`sse_thinking` 闩锁，防两路都来时重复）：
                             # ① 这里的 reasoning 增量 —— openclaw 2026.6.11 的 chat/completions
                             #    实现里 reasoning/thinking 出现 0 次，**不会**给；留着是给别的网关/
@@ -2122,21 +2136,27 @@ async def api_chat_stream(req: ChatRequest):
                             c = delta.get("content")
                             if c:
                                 got_text = True
+                                run_info["token_chars"] += len(c)
+                                run_info["text_tail"] = (run_info.get("text_tail", "") + c)[-160:]
                                 _emit("token", c)
                             if delta.get("tool_calls") and not tool_noted:
                                 tool_noted = True
                                 to_client("activity", "🔧 正在执行操作…")
                 # 流正常结束却既没正文也没 [DONE]：多半是端点没真开或中途断了。
                 # 不报错的话这一轮会静默落一条空回答，还会被 /api/chat/last 原样取回。
-                if not got_text and not saw_done:
-                    to_client("error", "❌ 网关流异常结束：没有收到任何内容（检查 "
-                                       "gateway.http.endpoints.chatCompletions 是否开启，"
-                                       "或设 EASEL_CHAT_TRANSPORT=cli 回退）")
+                run_info["saw_message_end"] = saw_done and run_info["stop_reason"] == "stop" and not run_info["error"]
+                if run_info["saw_message_end"]:
+                    run_info["last_ev"] = "assistant_message_end"
+                elif not run_info["error"] and (not saw_done or not run_info["stop_reason"]):
+                    run_info["stop_reason"] = "stream_incomplete"
+                    to_client("error", "❌ 网关事件流未完整结束，回复不能当作成功结果；请重试。")
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 to_client("error", f"❌ 网关连接失败：{str(e)[:140]}")
             finally:
+                if run_info["error"]:
+                    run_info["stop_reason"] = "gateway_error"
                 # 先把 SENTINEL 排进 q（FIFO 保证它排在本轮所有 token 之后），再标记完成：
                 # 主循环读到它时，前面的 token 必然已全部消费过。
                 q.put_nowait(SENTINEL)
@@ -2182,7 +2202,7 @@ async def api_chat_stream(req: ChatRequest):
                 "turn_id": turn_id, "clean_end": False, "stop_reason": "session_lock_timeout",
             })
             to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
-            to_client("done", sessionKey=sk)
+            to_client("done", sessionKey=sk, turn_id=turn_id, clean_end=False, stop_reason="session_lock_timeout")
             client_q.put_nowait(CLIENT_DONE)
             return
 
@@ -2200,7 +2220,7 @@ async def api_chat_stream(req: ChatRequest):
             xlock.release()
             lock.release()
             _save_turn(pk, "done", "", {"turn_id": turn_id, "clean_end": False, "stop_reason": "user_stopped"})
-            to_client("done", sessionKey=sk)
+            to_client("done", sessionKey=sk, turn_id=turn_id, clean_end=False, stop_reason="user_stopped")
             client_q.put_nowait(CLIENT_DONE)
             return
         if is_http:
@@ -2221,7 +2241,7 @@ async def api_chat_stream(req: ChatRequest):
                     "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
                 })
                 to_client("error", "❌ 启动失败，请重试")
-                to_client("done", sessionKey=sk)
+                to_client("done", sessionKey=sk, turn_id=turn_id, clean_end=False, stop_reason="spawn_failed")
                 client_q.put_nowait(CLIENT_DONE)
                 return
         _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
@@ -2233,11 +2253,6 @@ async def api_chat_stream(req: ChatRequest):
         q = asyncio.Queue()
         SENTINEL = object()
         stdout_lines = []
-        run_info: dict = {"stop_reason": None, "last_ev": None, "saw_message_end": False,
-                          "run_id": None,
-                          "fetch_count": 0, "token_chars": 0, "thinking_chars": 0,
-                          "delegated": False, "ignored_foreign_events": 0}
-
         def _drain_stdout():
             try:
                 for line in proc.stdout:
@@ -2510,6 +2525,15 @@ async def api_chat_stream(req: ChatRequest):
                 _pin_transport(sk, "http")
             user_stopped = sk in _STOPPED_CHAT
             _STOPPED_CHAT.discard(sk)
+            if user_stopped:
+                run_info["stop_reason"] = "user_stopped"
+            elif timed_out:
+                run_info["stop_reason"] = "timeout"
+            elif run_info["error"] and not run_info.get("stop_reason"):
+                run_info["stop_reason"] = "gateway_error" if is_http else "agent_error"
+            clean_end = (run_info.get("last_ev") == "assistant_message_end" and not run_info["error"]
+                         and not user_stopped and not timed_out and proc.poll() == 0
+                         and run_info.get("stop_reason") in {None, "stop", "end_turn"})
             # Reaching finally while the child is alive means timeout, explicit
             # stop, cancellation, or an internal stream failure. Never release
             # the session locks while such a process can still write history.
@@ -2542,7 +2566,7 @@ async def api_chat_stream(req: ChatRequest):
                         "rc": proc.poll(),
                         "stop_reason": run_info["stop_reason"],
                         "last_ev": run_info["last_ev"],
-                        "clean_end": run_info["last_ev"] == "assistant_message_end",
+                        "clean_end": clean_end,
                         "saw_message_end": run_info["saw_message_end"],
                         "fetch_count": run_info["fetch_count"],
                         "token_chars": run_info["token_chars"],
@@ -2557,15 +2581,15 @@ async def api_chat_stream(req: ChatRequest):
             # 落盘完整结果：后端跑完整轮不依赖客户端连接，断线后前端用 /api/chat/last 取回
             _save_turn(pk, "done", "".join(full_text), {
                 "turn_id": turn_id,
-                "clean_end": run_info.get("last_ev") == "assistant_message_end",
-                "stop_reason": "user_stopped" if user_stopped else run_info.get("stop_reason"),
+                "clean_end": clean_end,
+                "stop_reason": run_info.get("stop_reason"),
             })
             xlock.release()
             lock.release()
             _RUNNING_CHAT.pop(sk, None)
             if _RUNNING_CHAT_TURNS.get(sk) == turn_id:
                 _RUNNING_CHAT_TURNS.pop(sk, None)
-            to_client("done", sessionKey=sk)
+            to_client("done", sessionKey=sk, turn_id=turn_id, clean_end=clean_end, stop_reason=run_info.get("stop_reason"))
             client_q.put_nowait(CLIENT_DONE)
 
     # 把 run 跑在独立后台任务里（持强引用防 GC）——客户端断开不取消它。
@@ -2604,7 +2628,7 @@ async def api_chat_stream(req: ChatRequest):
                 if time.monotonic() - idle_since >= 30:
                     idle_since = time.monotonic()
                     yield {"event": "heartbeat", "data": json.dumps(
-                        "仍在处理中，未卡住…（复杂或制作类任务会花点时间）", ensure_ascii=False)}
+                        "仍在等待原 Agent 的下一条事件；尚未收到完整答复，可继续等待或停止。", ensure_ascii=False)}
                 continue
             if item is CLIENT_DONE:
                 break
@@ -2621,7 +2645,8 @@ async def api_chat_stream(req: ChatRequest):
             elif t == "error":
                 yield {"id": str(item["id"]), "event": "error", "data": json.dumps(item["text"], ensure_ascii=False)}
             elif t == "done":
-                yield {"id": str(item["id"]), "event": "done", "data": json.dumps({"sessionKey": item.get("sessionKey")}, ensure_ascii=False)}
+                yield {"id": str(item["id"]), "event": "done", "data": json.dumps(
+                    {k: item[k] for k in ("sessionKey", "turn_id", "clean_end", "stop_reason") if k in item}, ensure_ascii=False)}
 
     return EventSourceResponse(forward(), headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Content-Encoding": "identity"})
 
@@ -2716,9 +2741,9 @@ async def api_chat_stop(req: StopRequest):
 
 # Workflow execution reuses the exact original chat supervisor, tool runtime and
 # event stream. One dedicated session per project spans all nodes and chats.
-async def _workflow_agent_start(*, message: str, session_id: str, turn_id: str):
+async def _workflow_agent_start(*, message: str, session_id: str, turn_id: str, max_tokens: int | None = None):
     _WORKFLOW_AGENT_TURNS[session_id] = turn_id
-    return await api_chat_stream(ChatRequest(message=message, sessionId=session_id, turnId=turn_id))
+    return await api_chat_stream(ChatRequest(message=message, sessionId=session_id, turnId=turn_id, maxTokens=max_tokens))
 
 
 async def _workflow_agent_stop(*, session_id: str, turn_id: str):

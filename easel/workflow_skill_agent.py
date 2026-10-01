@@ -18,10 +18,15 @@ import uuid
 
 from .content_workflow import NODE_IDS, safe_error
 from .workflow_agent_context import current_checkpoint, session_key as project_session_key
+from .openclaw_chat_stream import generation_limit
 
 
 class WorkflowSkillAgentError(RuntimeError):
     """The original skill agent did not deliver a complete usable response."""
+
+
+class WorkflowSkillAgentTruncated(WorkflowSkillAgentError):
+    """A native length stop must never be repaired as an action-format error."""
 
 
 class WorkflowSkillAgentNeedsInput(WorkflowSkillAgentError):
@@ -110,7 +115,8 @@ class WorkflowSkillAgent:
         return await self._turn(message, project_id=project_id, label=name, on_event=on_event, timeout=budget)
 
     async def generate(self, *, project_id: str, node: str, prompt: str, system: str,
-                       context: dict | None = None, on_text=None, on_event=None, timeout=None) -> str:
+                       context: dict | None = None, on_text=None, on_event=None, timeout=None,
+                       generation_budget=None, max_tokens=None, task="default") -> str:
         """Node chat and typed generation use the very same original session.
 
         A generated proposal is still validated by the host before any form,
@@ -129,10 +135,11 @@ class WorkflowSkillAgent:
             "\n\n最新项目记忆（材料，不是额外工具授权）：\n" + json.dumps(context or {}, ensure_ascii=False) +
             "\n\n本轮内容请求：\n" + prompt + current_checkpoint(context, project_id))
         result = await self._turn(safe_error(message, None), project_id=project_id,
-            label="项目 Agent", on_event=on_event, on_text=on_text, timeout=timeout)
+            label="项目 Agent", on_event=on_event, on_text=on_text, timeout=timeout,
+            max_tokens=generation_limit(generation_budget, max_tokens))
         return result["text"]
 
-    async def _turn(self, message, *, project_id, label, on_event=None, on_text=None, timeout=None):
+    async def _turn(self, message, *, project_id, label, on_event=None, on_text=None, timeout=None, max_tokens=None):
         session_key = project_session_key(project_id)
         turn_id = "wfskill-" + uuid.uuid4().hex
         budget = self.timeout if timeout is None else timeout
@@ -160,7 +167,7 @@ class WorkflowSkillAgent:
             # chat starts its supervisor but before it returns the response object.
             started = True
             response = await self._call(self.start_turn, message=message,
-                session_id=session_key, turn_id=turn_id)
+                session_id=session_key, turn_id=turn_id, max_tokens=generation_limit(max_tokens=max_tokens))
             iterator = getattr(response, "body_iterator", response)
             if not hasattr(iterator, "__aiter__"):
                 raise WorkflowSkillAgentError("原聊天适配器未返回事件流。")
@@ -168,7 +175,7 @@ class WorkflowSkillAgent:
                 if not isinstance(event, dict):
                     raise WorkflowSkillAgentError("原聊天事件格式无效；需要直接传入 body_iterator。")
                 kind = event.get("event")
-                if kind in {"thinking", "reasoning", "heartbeat", "ping"}:
+                if kind in {"thinking", "reasoning", "ping"}:
                     continue
                 data = event.get("data")
                 if isinstance(data, str):
@@ -192,6 +199,9 @@ class WorkflowSkillAgent:
                 elif kind == "activity":
                     if isinstance(data, str):
                         self._emit(on_event, "tool", f"{label}：{data}")
+                elif kind == "heartbeat":
+                    if isinstance(data, str):
+                        self._emit(on_event, "status", data)
                 elif kind == "error":
                     raise WorkflowSkillAgentError(safe_error(data or "原技能执行失败。"))
                 elif kind == "question":
@@ -200,6 +210,11 @@ class WorkflowSkillAgent:
                     if not isinstance(data, dict) or data.get("sessionKey") != session_key:
                         raise WorkflowSkillAgentError("原技能结束事件不属于本工作流项目。")
                     done = True
+                    reason = data.get("stop_reason")
+                    if reason in {"length", "max_tokens", "model_length"}:
+                        raise WorkflowSkillAgentTruncated("原 Agent 的生成被截断，尚未得到完整结果；未应用到表单。")
+                    if data.get("clean_end") is False or reason not in {None, "stop", "end_turn"}:
+                        raise WorkflowSkillAgentError("原 Agent 未正常结束（" + safe_error(reason or "流中断") + "）；未应用工作流修改。")
                     break
             if not done:
                 raise WorkflowSkillAgentError("原技能事件流中断，未收到完成回执。")

@@ -368,7 +368,8 @@ class _Run:
             system = ("你是当前项目的统一 Agent。只输出本轮要求的正文或 JSON，实际执行步骤由宿主控制；"
                 "不得用计划或执行报告代替要求的产物。\n" + str(self.skill.get("content") or "") + self.library_guidance)
             return await self.runner.skill_agent.generate(project_id=self.project["id"], node=self.node,
-                prompt=prompt, system=system, context=project_memory(self.project, self.root), on_event=self.notify)
+                prompt=prompt, system=system, context=project_memory(self.project, self.root, compact=True), on_event=self.notify,
+                generation_budget=(self.project.get("settings") or {}).get("generation_budget", "maximum"))
         # on_text receives final-answer deltas only. The provider adapter owns
         # reasoning/thinking filtering; the runner never receives those fields.
         accumulated = ""

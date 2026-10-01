@@ -95,6 +95,25 @@ def test_public_metadata_only_and_no_reasoning_or_tool_output(tmp_path):
     feed.close()
 
 
+def test_compaction_progress_is_exact_run_scoped_and_contains_no_summary(tmp_path):
+    feed = adapter(tmp_path)
+    frame = event(seq=1)
+    frame["event"] = "agent"
+    frame["payload"]["stream"] = "compaction"
+    frame["payload"]["data"] = {"phase": "start", "summary": "PRIVATE SUMMARY", "messages": ["PRIVATE HOOK"]}
+    assert feed.accept(frame) == []
+    feed.bind_run("chatcmpl_own")
+    assert feed.ready == ["正在压缩项目会话历史，整理上下文后继续答复…"]
+    frame["payload"]["runId"] = "someone-else"
+    frame["payload"]["seq"] = 2
+    frame["payload"]["data"]["phase"] = "end"
+    assert feed.accept(frame) == []
+    frame["payload"]["runId"] = "chatcmpl_own"
+    assert feed.accept(frame) == ["项目会话历史压缩已结束，正在继续当前任务。"]
+    assert "PRIVATE" not in repr(feed.pending) + repr(feed.ready)
+    feed.close()
+
+
 def test_cli_binds_only_fresh_lifecycle_start(tmp_path):
     feed = adapter(tmp_path, allow_lifecycle_binding=True)
     frame = event(timestamp=0)

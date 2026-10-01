@@ -23,6 +23,38 @@ def event(kind, data):
     return {"id": "1", "event": kind, "data": json.dumps(data, ensure_ascii=False)}
 
 
+@pytest.mark.parametrize("reason", ["length", "max_tokens", "model_length", "stream_incomplete", "user_stopped", "tool_calls"])
+def test_native_terminal_failure_cannot_be_accepted_as_a_complete_proposal(case, reason):
+    args, root = case
+    async def start(**kwargs):
+        async def body():
+            yield event("token", "半句")
+            yield event("done", {"sessionKey": kwargs["session_id"], "stop_reason": reason, "clean_end": False})
+        return body()
+    async def stop(**kwargs):
+        pytest.fail("Terminal native run has ended; do not stop a later turn")
+    with pytest.raises(WorkflowSkillAgentError):
+        asyncio.run(WorkflowSkillAgent(start, stop, project_root=root).execute(**args))
+
+
+def test_native_heartbeat_is_visible_without_displaying_private_reasoning(case):
+    args, root = case
+    events, starts = [], []
+    async def start(**kwargs):
+        starts.append(kwargs)
+        async def body():
+            yield event("heartbeat", "仍在等待原 Agent 的下一条事件")
+            yield event("token", "完整答复")
+            yield event("done", {"sessionKey": kwargs["session_id"], "stop_reason": "stop", "clean_end": True})
+        return body()
+    async def stop(**kwargs): pass
+    result = asyncio.run(WorkflowSkillAgent(start, stop, project_root=root).generate(
+        project_id=args["project_id"], node="storyboard", prompt="先讨论", system="中文答复",
+        generation_budget="maximum", on_event=events.append))
+    assert result == "完整答复" and starts[0]["max_tokens"] == 65536
+    assert {"kind": "status", "text": "仍在等待原 Agent 的下一条事件"} in events
+
+
 def test_real_event_source_iterator_exposes_public_text_and_activity_only(case, monkeypatch):
     args, root = case
     events, starts, stops = [], [], []

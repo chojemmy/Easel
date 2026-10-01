@@ -61,6 +61,10 @@ class OpenClawLiveToolActivity:
         if run_id != self.run_id or seq <= self.last_seq:
             return []
         self.last_seq = seq
+        if kind == "compaction.start":
+            return ["正在压缩项目会话历史，整理上下文后继续答复…"]
+        if kind == "compaction.end":
+            return ["项目会话历史压缩已结束，正在继续当前任务。"]
         return self.fallback.render_metadata(run_id, kind, call_id, name, path, success)
 
     def accept(self, frame) -> list[str]:
@@ -70,7 +74,7 @@ class OpenClawLiveToolActivity:
         if not isinstance(payload, dict) or payload.get("sessionKey") != self.session_key:
             return []
         stream, run_id = payload.get("stream"), payload.get("runId")
-        if stream not in {"tool", "lifecycle"} or not isinstance(run_id, str):
+        if stream not in {"tool", "lifecycle", "compaction"} or not isinstance(run_id, str):
             return []
         if self.run_id is not None and run_id != self.run_id:
             return []
@@ -86,7 +90,18 @@ class OpenClawLiveToolActivity:
                 self.bind_run(run_id)
             return []
         seq, phase = payload.get("seq"), data.get("phase")
-        if type(seq) is not int or seq < 0 or phase not in {"start", "result"}:
+        if type(seq) is not int or seq < 0:
+            return []
+        if stream == "compaction":
+            if phase not in {"start", "end"}:
+                return []
+            metadata = (run_id, seq, "compaction." + phase, None, None, None, None)
+            if self.run_id is None:
+                if len(self.pending) < 200:
+                    self.pending.append(metadata)
+                return []
+            return self._render(metadata)
+        if phase not in {"start", "result"}:
             return []
         # Do not retain arbitrary args, result, partialResult, text or reasoning.
         args = data.get("args") if isinstance(data.get("args"), dict) else {}

@@ -34,7 +34,7 @@ def current_checkpoint(context: dict | None, project_id: str) -> str:
         "历史助手叫错稿名或宣称旧产物完成时，以此处实际状态为准。保留用户的创作要求和修改意见。")
 
 
-def project_memory(project: dict, root: Path | None = None) -> dict:
+def project_memory(project: dict, root: Path | None = None, *, compact: bool = False) -> dict:
     """Rebuild memory after every edit, so old agent history cannot override it."""
     nodes, history = [], []
     for node in project.get("nodes", []):
@@ -49,6 +49,13 @@ def project_memory(project: dict, root: Path | None = None) -> dict:
                     "content": message["content"][:24000], "at": message.get("created_at", ""),
                     "status": message.get("status"), "execution": message.get("execution")})
     history.sort(key=lambda item: item["at"])
+    if compact:
+        # Native transcript already holds full conversation. Repeat current
+        # user intent and a few completed receipts, not every long Agent reply.
+        users = [m for m in history if m["role"] == "user"][-16:]
+        replies = [m for m in history if m["role"] == "assistant" and m["status"] == "completed"][-4:]
+        history = sorted([{**m, "content": m["content"][:1600 if m["role"] == "user" else 500]}
+                          for m in users + replies], key=lambda item: item["at"])
     recent, remaining = [], 120000
     for message in reversed(history[-60:]):
         if remaining <= 0:

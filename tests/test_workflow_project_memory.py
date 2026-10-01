@@ -70,3 +70,49 @@ def test_current_checkpoint_keeps_selected_manuscript_distinct_from_stale_chat_n
     assert "旧错误名称" not in receipt
     assert current_checkpoint({"project_memory": memory}, p["id"]) == receipt
     assert current_checkpoint(memory, "wf-111111111111") == ""
+
+
+def test_native_request_sends_latest_facts_once_and_does_not_replay_failed_agent_output(tmp_path):
+    service = ContentWorkflowService(tmp_path, vault=tmp_path / "vault")
+    p = service.create({"title": "分镜项目"})
+    p["manuscripts"] = [{"id": "selected", "title": "新稿件", "content": "最新主稿保留全文"}]
+    p["primary_manuscript_id"] = "selected"
+    node_of(p, "transcript")["chat"] = {"messages": [
+        {"role": "user", "content": "每条字幕12字，末尾无标点", "status": "completed"},
+        {"role": "assistant", "content": "失效内容" * 6000, "status": "failed"}]}
+    node_of(p, "storyboard")["chat"] = {"messages": [{"role": "user", "content": "网页规划、本机执行，先讨论", "status": "completed"}]}
+    memory = project_memory(p, tmp_path, compact=True)
+    request = json.loads(chat.context_for(p, "storyboard", [], [{"name": "video-production", "description": "分镜方法",
+        "source_path": "/skills/video-production/SKILL.md", "execution_note": "冗余描述" * 500}], native=True))
+    assert request["request"] == "网页规划、本机执行，先讨论"
+    assert not any(k in request for k in ("project_memory", "history", "manuscripts"))
+    assert "失效内容" not in json.dumps(memory, ensure_ascii=False)
+    assert memory["primary_manuscript"]["content"] == "最新主稿保留全文"
+    assert any("12字" in m["content"] for m in memory["project_conversation"])
+    assert "execution_note" not in request["available_skills"][0]
+
+
+def test_length_retry_stays_native_and_never_applies_partial_action_or_repairs_format(tmp_path):
+    from easel.workflow_skill_agent import WorkflowSkillAgentTruncated
+    service = ContentWorkflowService(tmp_path, vault=tmp_path / "vault")
+    p = service.create({"title": "重试分镜"})
+    calls = []
+    class Native:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                kwargs["on_text"]("The")
+                raise WorkflowSkillAgentTruncated("length")
+            kwargs["on_text"]("先讨论分镜。")
+            return '先讨论分镜。\n<easel_action>{"action":"chat"}</easel_action>'
+    service.skill_agent = Native()
+    async def run():
+        await service.chat(p["id"], "storyboard", {"message": "先讨论，不执行", "content_version": p["content_version"]})
+        await service.tasks[p["id"]]
+    asyncio.run(run())
+    result = service.get(p["id"]); n = node_of(result, "storyboard")
+    assert len(calls) == 2 and all(c["project_id"] == p["id"] for c in calls)
+    assert calls[1]["generation_budget"] == "maximum"
+    assert "修复操作格式" not in calls[1]["system"]
+    assert n["chat"]["messages"][-1]["content"] == "先讨论分镜。"
+    assert n["status"] == "idle" and not n["runs"] and result["content_version"] == p["content_version"]
