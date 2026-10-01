@@ -15,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'easel-workbuddy-model.ps1')
 $Root = (Resolve-Path (Split-Path -Parent $PSScriptRoot)).Path
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 $LocalState = if ($env:EASEL_LOCAL_STATE) { $env:EASEL_LOCAL_STATE } else { Join-Path $env:LOCALAPPDATA 'Easel' }
@@ -222,6 +223,7 @@ function Import-ProtectedEnvironment {
         $env:APIBOBO_KEY = $apibobo
         $env:EASEL_MEDIA_TOKEN = $media
         $env:EASEL_ROOT = $Root
+        Import-EaselWorkBuddyModelEnvironment $LocalState
         Import-DotEnv
     } finally {
         $minimax = $null
@@ -234,7 +236,7 @@ function Import-ProtectedEnvironment {
 function Clear-ProtectedEnvironment {
     foreach ($name in @(
         'MINIMAX_API_KEY', 'APIBOBO_KEY', 'EASEL_MEDIA_TOKEN',
-        'EASEL_LLM_API_KEY', 'IMG_API_KEY', 'VIDEO_API_KEY', 'EASEL_EMBEDDING_API_KEY'
+        'EASEL_LLM_API_KEY', 'EASEL_WORKBUDDY_API_KEY', 'IMG_API_KEY', 'VIDEO_API_KEY', 'EASEL_EMBEDDING_API_KEY'
     )) {
         Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
     }

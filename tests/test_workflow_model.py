@@ -18,7 +18,7 @@ from easel.workflow_model import WorkflowModel, WorkflowModelConfigError, Workfl
 @pytest.fixture(autouse=True)
 def clean_environment(monkeypatch):
     for name in ("EASEL_WORKFLOW_MODEL", "EASEL_WORKFLOW_BASE_URL", "EASEL_WORKFLOW_KEY",
-                 "EASEL_WORKFLOW_API", "EASEL_WORKFLOW_PROXY", "EASEL_PROXY", "MINIMAX_API_KEY",
+                 "EASEL_WORKFLOW_API", "EASEL_WORKFLOW_PROXY", "EASEL_WORKFLOW_ALLOW_PRIVATE_HTTP", "EASEL_PROXY", "MINIMAX_API_KEY",
                  "TEST_MODEL_KEY", "KEY_ALIAS"):
         monkeypatch.delenv(name, raising=False)
 
@@ -200,6 +200,41 @@ def test_unsafe_base_is_rejected_without_network(config, monkeypatch, base):
     monkeypatch.setenv("EASEL_WORKFLOW_BASE_URL", base)
     with pytest.raises(WorkflowModelConfigError):
         run(WorkflowModel(config))
+
+
+def test_workflow_follows_the_selected_non_minimax_provider(config, monkeypatch):
+    data = json.loads(config.read_text())
+    data["agents"]["defaults"]["model"]["primary"] = "workbuddy/dsv4flash0731"
+    data["models"]["providers"]["workbuddy"] = {"baseUrl": "https://internal.example/v1", "api": "openai-completions", "apiKey": "${TEST_MODEL_KEY}", "models": [{"id": "dsv4flash0731"}]}
+    config.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setenv("MINIMAX_API_KEY", "unrelated-minimax-secret")
+    selected = WorkflowModel(config)._settings()
+    assert selected.provider == "workbuddy" and selected.model == "dsv4flash0731"
+    assert selected.key == "test-credential-not-real" and selected.api == "openai-completions"
+
+
+@pytest.mark.parametrize("base", ["http://192.168.242.13:8900/v1", "http://10.2.3.4:8900/v1"])
+def test_internal_http_model_requires_opt_in_and_avoids_the_overseas_proxy(config, monkeypatch, base):
+    monkeypatch.setenv("EASEL_WORKFLOW_BASE_URL", base)
+    monkeypatch.setenv("EASEL_WORKFLOW_KEY", "internal-test-secret")
+    with pytest.raises(WorkflowModelConfigError):
+        WorkflowModel(config).describe()
+    monkeypatch.setenv("EASEL_WORKFLOW_ALLOW_PRIVATE_HTTP", "1")
+    monkeypatch.setenv("EASEL_PROXY", "http://127.0.0.1:7890")
+    seen = []
+    def client_factory(**kwargs):
+        seen.append(kwargs)
+        return httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"choices": [{"message": {"content": "连接成功"}, "finish_reason": "stop"}]})), **kwargs)
+    assert run(WorkflowModel(config, client_factory=client_factory)) == "连接成功"
+    assert "proxy" not in seen[0] and seen[0]["trust_env"] is False
+
+
+@pytest.mark.parametrize("base", ["http://8.8.8.8/v1", "http://169.254.169.254/v1", "http://0.0.0.0/v1", "http://remote.example/v1"])
+def test_private_http_opt_in_does_not_allow_public_or_special_hosts(config, monkeypatch, base):
+    monkeypatch.setenv("EASEL_WORKFLOW_BASE_URL", base)
+    monkeypatch.setenv("EASEL_WORKFLOW_ALLOW_PRIVATE_HTTP", "1")
+    with pytest.raises(WorkflowModelConfigError):
+        WorkflowModel(config).describe()
 
 
 @pytest.mark.parametrize("response", [

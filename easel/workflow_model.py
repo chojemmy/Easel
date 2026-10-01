@@ -118,11 +118,14 @@ def _safe_base(value: str) -> str:
         raise WorkflowModelConfigError("模型 Base URL 必须是无凭证和查询参数的 HTTP(S) 地址。")
     if parsed.scheme == "http":
         try:
-            loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+            address = ipaddress.ip_address(parsed.hostname)
+            loopback = address.is_loopback
+            private_allowed = _env_value("EASEL_WORKFLOW_ALLOW_PRIVATE_HTTP") == "1" and address.is_private and not address.is_unspecified and not address.is_link_local and not address.is_multicast
         except ValueError:
             loopback = parsed.hostname.lower() == "localhost"
-        if not loopback:
-            raise WorkflowModelConfigError("远程模型连接需要 HTTPS；HTTP 仅限本机地址。")
+            private_allowed = False
+        if not loopback and not private_allowed:
+            raise WorkflowModelConfigError("远程模型连接需要 HTTPS；本机 HTTP 可直接使用，指定内网 IP 需显式设置 EASEL_WORKFLOW_ALLOW_PRIVATE_HTTP=1。")
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
@@ -296,7 +299,7 @@ class WorkflowModel:
                     model = override_model
             else:
                 model = override_model
-        elif "/" in primary and primary.partition("/")[0].lower().startswith("minimax"):
+        elif "/" in primary:
             provider_name, _, model = primary.partition("/")
         provider = providers.get(provider_name, {})
         provider = provider if isinstance(provider, dict) else {}
@@ -306,7 +309,7 @@ class WorkflowModel:
                 model = next((item.get("id", "") for item in candidates
                               if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]), "")
         if not model or len(model) > 240 or any(char in model for char in "\r\n"):
-            raise WorkflowModelConfigError("未配置工作流模型，请配置 MiniMax 或 EASEL_WORKFLOW_MODEL。")
+            raise WorkflowModelConfigError("未配置工作流模型，请设置 OpenClaw 主模型或 EASEL_WORKFLOW_MODEL。")
         override_base = _env_value("EASEL_WORKFLOW_BASE_URL")
         raw_base = override_base or provider.get("baseUrl")
         if not isinstance(raw_base, str) or not raw_base.strip():
@@ -334,7 +337,7 @@ class WorkflowModel:
             key = _env_value("MINIMAX_API_KEY")
         key = key or _referenced_key(provider.get("apiKey"))
         if not key:
-            raise WorkflowModelConfigError("缺少可用的模型环境密钥：请配置 EASEL_WORKFLOW_KEY 或 MINIMAX_API_KEY。")
+            raise WorkflowModelConfigError("缺少可用的模型环境密钥：请配置所选供应商的环境密钥或 EASEL_WORKFLOW_KEY。")
         return _Settings(provider_name, model, base, api, key)
 
     def describe(self) -> dict[str, str]:
@@ -520,6 +523,15 @@ class WorkflowModel:
         proxy = _env_value("EASEL_WORKFLOW_PROXY") or _env_value("EASEL_PROXY")
         if not proxy and urlsplit(settings.base_url).hostname == "api.minimax.io":
             proxy = "http://127.0.0.1:7890"
+        try:
+            local_address = ipaddress.ip_address(urlsplit(settings.base_url).hostname or "")
+            private_host = local_address.is_private
+        except ValueError:
+            private_host = urlsplit(settings.base_url).hostname == "localhost"
+        if private_host and not _env_value("EASEL_WORKFLOW_PROXY"):
+            # The global overseas proxy should not route local/LAN model calls.
+            proxy = ""
+            options["trust_env"] = False
         if proxy:
             options["proxy"] = proxy
         factory = self.client_factory or httpx.AsyncClient
