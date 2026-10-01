@@ -375,7 +375,7 @@ class ContentWorkflowService:
         try:
             if self.executor is None:
                 from .workflow_runner import WorkflowRunner
-                self.executor = WorkflowRunner(self.root)
+                self.executor = WorkflowRunner(self.root, skill_agent=getattr(self, "skill_agent", None))
             result = await self.executor.execute(snapshot, node, options, skill, self.directory(project_id),
                 lambda text: self.progress(project_id, node, run_id, text))
             with self._lock:

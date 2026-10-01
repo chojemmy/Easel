@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import time
+from pathlib import Path
 
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
@@ -28,19 +29,26 @@ def main():
     ap.add_argument('--lang', default='zh')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--compute', default='float16')
+    ap.add_argument('--reference-file', help='已选口播稿，只作为术语/识别上下文，不能代替录音')
+    ap.add_argument('--local-files-only', action='store_true', help='只用已存在的本地模型，禁止下载')
     args = ap.parse_args()
 
     from faster_whisper import WhisperModel
 
     t0 = time.time()
     print('loading model...', flush=True)
-    model = WhisperModel(args.model, device=args.device, compute_type=args.compute)
+    model = WhisperModel(args.model, device=args.device, compute_type=args.compute,
+                         local_files_only=args.local_files_only)
     print(f'model loaded {time.time() - t0:.1f}s', flush=True)
 
     t1 = time.time()
+    reference = Path(args.reference_file).read_text(encoding='utf-8-sig').strip() if args.reference_file else ''
     segments, info = model.transcribe(
-        args.src, language=args.lang, word_timestamps=True, vad_filter=False, beam_size=5)
-    result = {'language': info.language, 'duration': info.duration, 'segments': []}
+        args.src, language=args.lang, word_timestamps=True, vad_filter=False, beam_size=5,
+        initial_prompt=reference[:2000] or None)
+    result = {'language': info.language, 'duration': info.duration, 'segments': [],
+              'source': str(Path(args.src).resolve()), 'asr_model': str(args.model),
+              'reference_used': bool(reference), 'source_kind': 'local-asr'}
     for s in segments:
         result['segments'].append({
             'start': round(s.start, 3),

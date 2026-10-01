@@ -390,6 +390,7 @@ def test_missing_asr_blocks_without_spawning_download(case,monkeypatch):
     (directory/"artifacts/source-metadata.json").write_text('{"duration":10,"source_path":"unused.mp4"}',encoding="utf-8")
     (directory/"sdk/run-state.json").write_text('{"stages":{},"config":{}}',encoding="utf-8")
     monkeypatch.delenv("SILICONFLOW_API_KEY",raising=False)
+    monkeypatch.setattr("easel.workflow_asr.find_local_model", lambda *args, **kwargs: None)
     async def no_process(*args, **kwargs):
         pytest.fail("No ASR subprocess may start without a source or configured model")
     monkeypatch.setattr(module._Run,"command",no_process)

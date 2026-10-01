@@ -1,8 +1,8 @@
-"""Fixed, cancellable content-production steps. Models return text or bounded data.
+"""Cancellable content-production steps with checked inputs and typed outputs.
 
-No model-generated command or source code is executed. The shared video SDK is
-used through its CLI for ingest/transcription; each render has isolated sources,
-props and public assets while reusing the installed Remotion dependencies.
+Host tools use the shared video SDK CLI. Transcription may delegate its validated
+local tool task to the original Easel Agent; returned files and corrections are
+checked before entering the workflow. Renders keep isolated sources and assets.
 """
 from __future__ import annotations
 
@@ -169,8 +169,9 @@ async def generate(prompt: str, *, system: str, task: str | None = None,
 
 
 class WorkflowRunner:
-    def __init__(self, project_root: Path):
+    def __init__(self, project_root: Path, *, skill_agent=None):
         self.root = Path(project_root).resolve()
+        self.skill_agent = skill_agent
         self.sdk = self.root / "skills/openclaw/video-production/vendor/video-pipeline-sdk"
         self.deps = self.sdk / "deps/remotion"
 
@@ -447,7 +448,7 @@ class _Run:
             "brief": ("video-strategy", "text-condenser"),
             "script": ("video-script", "text-polisher"),
             "source": ("video-production", "asset-manager"),
-            "transcript": ("video-production", "auto-subtitle", "text-polisher"),
+            "transcript": ("video-production", "auto-subtitle"),
             "storyboard": ("video-production", "video-script"),
             "build": ("video-production", "remotion-video-production", "remotion-best-practices"),
             "review": ("video-production", "skill-quality-gate"),
@@ -509,7 +510,7 @@ class _Run:
                     raise RunnerBlocked(f"无法完整读取 {name}/{path}：{exc}") from exc
         if not documents:
             return ""
-        self.notify({"kind": "status", "text": "原 Skill 已作为当前节点的内容与检查参考；实际工具仍由固定执行器调用，不代表已运行 Skill 中的全部脚本或通过全部检查。"})
+        self.notify({"kind": "status", "text": "原 Skill 已作为当前节点的内容与检查参考；实际工具调用会单独记录，读取规范不代表已运行全部脚本或通过全部检查。"})
         writing = ("将 video-script 的结构方法与 text-polisher 的中文润色方法用于同一次创作。最终只输出可采用的稿件正文，"
                    "不附评分表、执行报告或 JSON。" if self.node == "script" else "")
         return ("\n\n以下是宿主实际读取的原有 Skill 与参考指南。项目需求、修改意见与本节点规范优先；只应用与当前节点和已支持能力"
@@ -570,9 +571,72 @@ class _Run:
             raise RunnerBlocked("SDK 未生成素材检查帧。")
         return {"status": "completed", "message": "已核实音视频轨并抽帧；保留原片时间轴，未进行粗剪或代理转码。", "media": {**(self.project.get("media") or {}), **media, "source_path": str(source)}, "artifacts": [self.artifact(path, "原片元数据"), *[self.artifact(frame, "原片检查帧", "inspection_frame") for frame in frames]]}
 
+    async def local_transcription(self, metadata, model, reference, reference_path):
+        """Use the original Agent when installed, with validated local inputs."""
+        target_dir = self.artifacts / ("agent-transcript-" + uuid.uuid4().hex[:12])
+        target_dir.mkdir(parents=True)
+        target = target_dir / "transcript.json"
+        args = [self.python, str(self.runner.sdk / "tools/transcribe.py"), "--src", metadata["source_path"],
+                "--out", str(target), "--model", model["path"], "--device", "cpu", "--compute", "int8", "--local-files-only"]
+        if reference_path:
+            args += ["--reference-file", str(reference_path)]
+        correction = None
+        if self.runner.skill_agent is None:
+            await self.command(args, timeout=7200, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+                               label=f"本地 ASR：{model['name']}（已缓存、离线）")
+        else:
+            from .workflow_skill_catalog import WorkflowSkillCatalog
+            catalog = WorkflowSkillCatalog(self.root)
+            source = catalog.resolve_source("video-production", node="transcript")
+            task = (
+                "仅执行当前转录节点，不做分镜、剪辑、渲染或发布。读取真实 Skill、已选主稿（若有），"
+                "然后实际运行 context.command_argv 给出的项目解释器与转录脚本；这是已验证的完整本地模型。"
+                "使用 --local-files-only，禁止安装依赖、下载模型或改用云端；禁止猜测、均分或按字数估算时间戳。"
+                "transcript.json 必须由该脚本根据原录音生成，保持原始 ASR 文字和时间戳，不修改它来伪装校对。"
+                "如果有参考主稿或修改意见，另外在产物目录写 corrections.json："
+                '{"corrections":[{"index":0,"text":"校正后的整段文字"}],"unsupported_requests":[]}。'
+                "只修明确的错词、专名、标点；index 为原转录零基序号。不改时间、不删句、不把未说出的稿件补进去、"
+                "不把口播改写成文章。不确定的差异保留录音原文；没有确需修正的项时写空列表。"
+                "宿主会验证并应用 corrections，不能直接修改工作流主稿、状态或确认记录。"
+            )
+            self.notify({"kind": "tool", "text": "转录本步已接入原 Easel Agent，将读取主稿并调用本地 ASR 工具。"})
+            await self.runner.skill_agent.execute(project_id=self.project["id"], node="transcript",
+                skill={"name": "video-production", "layer": "produce", "source_path": str(source)},
+                instruction=task, directory=target_dir,
+                context={"command_argv": args, "reference_path": str(reference_path) if reference_path else "",
+                         "reference_manuscript": reference, "feedback": self.options.get("feedback", ""),
+                         "duration": metadata["duration"], "asr_model": model, "node_standard": self.skill.get("content", "")},
+                on_event=self.notify, timeout=1200)
+            if reference or self.options.get("feedback"):
+                correction_path = target_dir / "corrections.json"
+                if correction_path.is_symlink() or not correction_path.is_file():
+                    raise RunnerBlocked("原 Agent 尚未交付主稿校对结果，原始转录保留；请查看执行记录。")
+                correction = read_json(correction_path)
+        if target.is_symlink() or not target.is_file() or not target.resolve().is_relative_to(target_dir.resolve()):
+            raise RunnerBlocked("转录工具未交付本次项目内的真实字幕文件。")
+        data = read_json(target)
+        if data.get("source") != str(Path(metadata["source_path"]).resolve()):
+            raise RunnerBlocked("转录结果没有匹配本次原片，未应用。")
+        validate_transcript(data, metadata["duration"])
+        return target, correction
+
     async def step_transcript(self):
         metadata = read_json(self.artifacts / "source-metadata.json")
         supplied = self.file_setting("transcript_path", False)
+        reference = self.primary()
+        reference_text = str((reference or {}).get("content") or "").strip()
+        reference_path = None
+        reference_record = None
+        if reference_text:
+            reference_path = self.artifacts / "transcript-reference.md"
+            reference_path.write_text(reference_text + "\n", encoding="utf-8")
+            reference_record = {"id": reference.get("id"), "title": reference.get("title"),
+                                "sha256": hashlib.sha256(reference_text.encode("utf-8")).hexdigest()}
+            self.notify({"kind": "tool", "text": f"已读取当前主稿：{reference.get('title') or '口播稿'}（{len(reference_text)} 字），用于识别上下文和术语校对。"})
+        else:
+            self.notify("没有已选主稿，将按原录音转录；时间轴仍来自音频。")
+        model = None
+        correction = None
         state_path = self.sdk_run / "run-state.json"
         state = read_json(state_path)
         state["stages"]["transcribe"] = {"status": "pending"}
@@ -586,18 +650,27 @@ class _Run:
                 state["config"]["transcript"] = str(normalized)
             else:
                 state["config"]["transcript"] = str(supplied)
-        elif not os.environ.get("SILICONFLOW_API_KEY", "").strip():
-            model_dir = (self.project.get("settings") or {}).get("asr_model_path")
-            if not model_dir or not (Path(model_dir) / "model.bin").is_file():
-                raise RunnerBlocked("没有现成字幕、云端 ASR 凭证或已配置本地模型。请提供 SRT，或配置 ASR；不会自动下载约 3GB 模型。")
-            local_transcript = self.artifacts / "local-transcript.json"
-            await self.command([self.python, self.runner.sdk / "tools/transcribe.py", "--src", metadata["source_path"], "--out", local_transcript, "--model", Path(model_dir).resolve(), "--device", "cpu", "--compute", "int8"], timeout=7200, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}, label="使用已存在的本地 ASR 模型")
-            state["config"]["transcript"] = str(local_transcript)
+        else:
+            from .workflow_asr import find_local_model
+            try:
+                model = await asyncio.to_thread(find_local_model, self.root,
+                    settings=self.project.get("settings"), options=self.options)
+            except ValueError as exc:
+                raise RunnerBlocked(str(exc)) from None
+            if model:
+                self.notify({"kind": "tool", "text": f"自动发现完整本地 ASR 模型：{model['name']} · {model['path']}；使用 CPU/int8，无需下载。"})
+                local_transcript, correction = await self.local_transcription(metadata, model, reference_text, reference_path)
+                state["config"]["transcript"] = str(local_transcript)
+            elif not os.environ.get("SILICONFLOW_API_KEY", "").strip():
+                raise RunnerBlocked("已检查本地模型配置、Easel 和 Hugging Face 缓存，未找到完整的 faster-whisper 模型，也没有云端 ASR 凭证。" + ("口播稿已读取，但没有录音时间戳；" if reference_text else "") + "请提供 SRT 或已有模型路径，不会自动下载模型。")
         write_json(state_path, state)
         await self.sdk_command("stage", "transcribe", "--run-dir", self.sdk_run, env={"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
-        segments = validate_transcript(read_json(self.sdk_run / "artifacts/transcript.json"), metadata["duration"])
-        if self.options.get("feedback"):
-            correction = parse_json_reply(await self.model("仅按修改意见校正转录错词/专有名词，不能改时间戳、删句、粗剪、增编台词或改原意。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests，不得伪称完成。原文：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False)))
+        raw_data = read_json(self.sdk_run / "artifacts/transcript.json")
+        segments = validate_transcript(raw_data, metadata["duration"])
+        raw_path = write_json(self.artifacts / "raw-transcript.json", {**raw_data, "duration": metadata["duration"], "source_sha256": metadata.get("source_sha256")})
+        if correction is None and (self.options.get("feedback") or (not supplied and reference_text)):
+            correction = parse_json_reply(await self.model("结合已选主稿和修改意见，仅校正转录错词/专有名词/标点。主稿是参考而非实际说出的文字；不得插入未说出的稿件，不能改时间戳、删句、粗剪、增编台词或改原意。不确定时保留录音原文。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests。参考主稿：" + reference_text + "\n实际转录：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False)))
+        if correction is not None:
             if not isinstance(correction,dict) or set(correction) != {"corrections","unsupported_requests"} or not isinstance(correction["corrections"],list) or not isinstance(correction["unsupported_requests"],list):
                 raise RunnerBlocked("字幕校正必须返回 corrections 和 unsupported_requests 两个列表。")
             if correction["unsupported_requests"]:
@@ -609,10 +682,19 @@ class _Run:
                 seen.add(item["index"])
                 segments[item["index"]]["text"] = item["text"].strip()
             segments = validate_transcript({"segments":segments},metadata["duration"])
+            self.notify({"kind": "result", "text": f"已依据主稿/修改意见校对 {len(correction['corrections'])} 条字幕，保留全部原录音时间戳。"})
         transcript_path = write_json(self.artifacts / "transcript.json", {"segments": segments, "duration": metadata["duration"], "source_sha256":metadata.get("source_sha256"), "timeline_mode": "original_no_cuts"})
         captions = [{"text": s["text"], "startMs": round(s["start"] * 1000), "endMs": round(s["end"] * 1000), "timestampMs": None, "confidence": None} for s in segments]
         caption_path = write_json(self.artifacts / "captions.json", captions)
-        return {"status": "completed", "message": f"已校验 {len(segments)} 条真实时间戳字幕，时间轴保持原片。", "artifacts": [self.artifact(transcript_path, "转写时间轴"), self.artifact(caption_path, "Remotion 字幕")], "media": {**(self.project.get("media") or {}), "generated_transcript_path": str(transcript_path), "transcript_source_sha256":metadata.get("source_sha256")}}
+        report = write_json(self.artifacts / "transcription-report.json", {"asr_model": model, "reference_manuscript": reference_record,
+            "reference_corrected": correction is not None, "correction_count": len(correction["corrections"]) if correction else 0,
+            "segments": len(segments), "source_sha256": metadata.get("source_sha256"), "timeline_mode": "original_no_cuts",
+            "executor": "original_agent" if model and self.runner.skill_agent is not None else "host_tools"})
+        artifacts = [self.artifact(transcript_path, "转写时间轴"), self.artifact(raw_path, "原始识别结果"),
+                     self.artifact(caption_path, "Remotion 字幕"), self.artifact(report, "转录与主稿校对报告")]
+        if reference_path:
+            artifacts.append(self.artifact(reference_path, "本次使用的口播稿"))
+        return {"status": "completed", "message": f"已校验 {len(segments)} 条真实时间戳字幕，{'已参考当前主稿校对，' if correction is not None and reference_text else ''}时间轴保持原片。", "artifacts": artifacts, "media": {**(self.project.get("media") or {}), "generated_transcript_path": str(transcript_path), "transcript_source_sha256":metadata.get("source_sha256")}}
 
     async def step_storyboard(self):
         metadata = read_json(self.artifacts / "source-metadata.json")
