@@ -3,7 +3,7 @@ import json
 
 from easel import workflow_chat as chat
 from easel.content_workflow import ContentWorkflowService, node_of
-from easel.workflow_agent_context import project_memory
+from easel.workflow_agent_context import current_checkpoint, project_memory
 import pytest
 
 
@@ -55,3 +55,18 @@ def test_subtitle_length_edits_invalidate_subtitles_and_downstream_but_keep_reco
     for invalid in (7, 41, "12", 12.5, 16.0, True):
         with pytest.raises(ValueError, match="字幕字数"):
             service.patch(p["id"], {"settings": {"subtitle_max_chars": invalid}})
+
+
+def test_current_checkpoint_keeps_selected_manuscript_distinct_from_stale_chat_names(tmp_path):
+    service = ContentWorkflowService(tmp_path, vault=tmp_path / "vault")
+    p = service.create({"title": "视频项目名"})
+    p["manuscripts"] = [{"id": "ms-primary", "title": "新稿件", "content": "实际口播稿"}]
+    p["primary_manuscript_id"] = "ms-primary"
+    node_of(p, "transcript")["chat"] = {"messages": [{"role": "assistant", "content": "主稿叫旧错误名称", "status": "completed"}]}
+    memory = project_memory(p)
+    receipt = current_checkpoint(memory, p["id"])
+    assert '"project_title": "视频项目名"' in receipt
+    assert '"primary_manuscript_title": "新稿件"' in receipt
+    assert "旧错误名称" not in receipt
+    assert current_checkpoint({"project_memory": memory}, p["id"]) == receipt
+    assert current_checkpoint(memory, "wf-111111111111") == ""

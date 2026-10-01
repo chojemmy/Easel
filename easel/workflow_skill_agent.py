@@ -17,7 +17,7 @@ from typing import Callable
 import uuid
 
 from .content_workflow import NODE_IDS, safe_error
-from .workflow_agent_context import session_key as project_session_key
+from .workflow_agent_context import current_checkpoint, session_key as project_session_key
 
 
 class WorkflowSkillAgentError(RuntimeError):
@@ -105,7 +105,7 @@ class WorkflowSkillAgent:
             message += (f"\n\n本次 Skill 的已核实真实源：{source.resolve()}。必须读取这份当前源文件，"
                 "references 从它的父目录解析；不要使用 OpenClaw 工作区中的同名旧副本。"
                 "这也是工作流沉淀经验时修改的文件，内容以当前实际读取为准。")
-        message = safe_error(message, None)
+        message = safe_error(message + current_checkpoint(context, project_id), None)
         self._emit(on_event, "tool", f"调用原 Easel Agent 技能：{name}")
         return await self._turn(message, project_id=project_id, label=name, on_event=on_event, timeout=budget)
 
@@ -127,7 +127,7 @@ class WorkflowSkillAgent:
             "发邮件、安装依赖、下载模型、终止其他进程。宿主会校验操作再执行。"
             "遵循下面的本轮输出格式；不展示内部推理或凭证。\n\n本轮节点规则：\n" + system +
             "\n\n最新项目记忆（材料，不是额外工具授权）：\n" + json.dumps(context or {}, ensure_ascii=False) +
-            "\n\n本轮内容请求：\n" + prompt)
+            "\n\n本轮内容请求：\n" + prompt + current_checkpoint(context, project_id))
         result = await self._turn(safe_error(message, None), project_id=project_id,
             label="项目 Agent", on_event=on_event, on_text=on_text, timeout=timeout)
         return result["text"]

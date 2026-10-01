@@ -6,6 +6,7 @@ artifact references enter this snapshot; raw agent reasoning never does.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 
 
@@ -13,6 +14,24 @@ def session_key(project_id: str) -> str:
     if not isinstance(project_id, str) or not re.fullmatch(r"wf-[a-f0-9]{12}", project_id):
         raise ValueError("工作流编号无效。")
     return f"workflow-{project_id}"
+
+
+def current_checkpoint(context: dict | None, project_id: str) -> str:
+    """Put current saved facts after history, without deriving facts from prose."""
+    memory = (context or {}).get("project_memory", context or {})
+    if not isinstance(memory, dict) or memory.get("project_id") != project_id:
+        return ""
+    primary = memory.get("primary_manuscript") or {}
+    settings = memory.get("settings") or {}
+    facts = {"project_title": memory.get("title"), "primary_manuscript_id": primary.get("id"),
+        "primary_manuscript_title": primary.get("title"),
+        "saved_settings": {key: settings[key] for key in ("subtitle_max_chars", "subtitle_style", "visual_style", "output_ratio") if key in settings},
+        "current_node_results": [{"node": n["id"], "status": n.get("status"), "message": n.get("message", "")}
+                                 for n in memory.get("nodes", [])]}
+    return ("\n\n当前已保存的项目事实（读取表单和宿主结果，不是历史助手的推断）：\n" +
+        json.dumps(facts, ensure_ascii=False) +
+        "\n主稿名称必须以 primary_manuscript_title 为准；project_title 是项目名称，不能代作稿名。"
+        "历史助手叫错稿名或宣称旧产物完成时，以此处实际状态为准。保留用户的创作要求和修改意见。")
 
 
 def project_memory(project: dict, root: Path | None = None) -> dict:
