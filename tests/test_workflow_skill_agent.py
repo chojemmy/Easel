@@ -129,6 +129,31 @@ def test_chat_generation_and_skill_execution_share_native_session(case):
     assert "句尾无标点" in starts[0]["message"] and "统一 Agent 会话" in starts[0]["message"]
 
 
+def test_formal_json_generation_overrides_chat_framing_in_the_same_session(case):
+    args, root = case
+    starts = []
+    async def start(**kwargs):
+        starts.append(kwargs)
+        async def body():
+            yield event("token", '{"scenes":[]}')
+            yield event("done", {"sessionKey": kwargs["session_id"], "stop_reason": "stop", "clean_end": True})
+        return body()
+    async def stop(**kwargs):
+        pytest.fail("Completed JSON generation must not stop any turn")
+    async def run():
+        agent = WorkflowSkillAgent(start, stop, project_root=root)
+        await agent.generate(project_id=args["project_id"], node="storyboard", prompt="讨论分镜", system="正常对话")
+        await agent.generate(project_id=args["project_id"], node="storyboard", prompt="正式生成分镜", system="输出JSON",
+            context={"previous_chat": "旧对话中附easel_action"}, output_format="json")
+    asyncio.run(run())
+    assert starts[0]["session_id"] == starts[1]["session_id"] == "workflow-wf-0123456789ab"
+    assert starts[0]["turn_id"] != starts[1]["turn_id"]
+    assert "本轮是节点对话/内容提议" in starts[0]["message"]
+    assert "宿主已启动的节点产物生成" in starts[1]["message"]
+    assert "历史聊天使用的操作块规则不适用" in starts[1]["message"]
+    assert starts[1]["message"].endswith("本次最终输出必须是一个完整JSON对象，仅JSON，不带easel_action、围栏或其他正文；继续遵循本轮实际字段和校验约束。")
+
+
 def test_pins_current_library_source_instead_of_profile_copy(case):
     args, root = case
     source = root / "skills/openclaw/text-polisher/SKILL.md"

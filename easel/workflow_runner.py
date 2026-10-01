@@ -68,11 +68,49 @@ def parse_json_reply(value):
             return value
         value = value["text"]
     text = str(value).strip()
-    text = re.sub(r"\A```(?:json)?\s*|\s*```\Z", "", text)
     try:
         return json.loads(text)
-    except (ValueError, TypeError) as exc:
-        raise RunnerBlocked("模型没有返回有效 JSON，请修订本节点 Skill 后重试。") from exc
+    except (ValueError, TypeError):
+        pass
+    # Native chat history may leave an action envelope after an otherwise
+    # complete artifact. It is metadata, never an instruction to execute here.
+    text = re.sub(r"(?s)(?:^|\n)\s*<easel_action>.*\Z", "", text).strip()
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    candidates = []
+    if "```" in text:
+        if text.count("```") % 2:
+            raise RunnerBlocked("Agent 的 JSON 围栏未闭合；请查看执行记录。")
+        for language, body in re.findall(r"```(?:([A-Za-z][\w+-]*)[ \t]*)?\s*(.*?)```", text, re.S):
+            is_json = language.lower() == "json" or body.lstrip().startswith(("{", "["))
+            try:
+                candidate = json.loads(body.strip())
+            except (ValueError, TypeError):
+                if is_json:
+                    raise RunnerBlocked("Agent 的 JSON 内容不完整或格式无效；请查看执行记录。") from None
+                continue
+            if isinstance(candidate, (dict, list)):
+                candidates.append(candidate)
+    else:
+        decoder, consumed = json.JSONDecoder(), -1
+        for match in re.finditer(r"[\[{]", text):
+            if match.start() < consumed:
+                continue
+            body = text[match.start():].lstrip()
+            offset = len(text[match.start():]) - len(body)
+            try:
+                candidate, end = decoder.raw_decode(body)
+            except ValueError:
+                # Do not salvage nested objects from a truncated outer JSON.
+                raise RunnerBlocked("Agent 的回复尚未形成完整 JSON；请查看执行记录。") from None
+            consumed = match.start() + offset + end
+            if isinstance(candidate, (dict, list)):
+                candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
+    raise RunnerBlocked("Agent 的回复无法解析为唯一完整 JSON；请查看执行记录。")
 
 
 def validate_transcript(data: dict, duration: float) -> list[dict]:
@@ -114,8 +152,10 @@ def validate_timeline(value: dict, duration: float) -> dict:
             raise RunnerBlocked("分镜标题/目的必填，卡片限 70 字。")
         if card:
             cards += 1
-            if start - last_card < 8 or end - start < 2:
-                raise RunnerBlocked("关键卡片至少间隔 8 秒，所在镜头至少 2 秒。")
+            if start - last_card < 8:
+                raise RunnerBlocked(f"分镜 {index + 1} 的卡片从 {start:g} 秒开始，与前一卡片相隔 {start - last_card:g} 秒；至少间隔 8 秒。")
+            if end - start < 2:
+                raise RunnerBlocked(f"分镜 {index + 1} 的卡片所在镜头仅 {end - start:g} 秒；至少持续 2 秒。")
             last_card = start
         output.append({"title": title, "start": start, "end": end, "purpose": purpose, "card": card})
         previous = end
@@ -205,6 +245,7 @@ class _Run:
         self.python = str(self.root / ".venv/Scripts/python.exe") if (self.root / ".venv/Scripts/python.exe").is_file() else sys.executable
         self.library_skills_used: list[dict] = []
         self.library_guidance = ""
+        self.model_receipts = []
 
     def notify(self, text: str | dict):
         if self.progress:
@@ -340,6 +381,7 @@ class _Run:
                 result["manual_verification_url"] = "https://channels.weixin.qq.com/" if receipt.get("platform") == "weixin-channels" else "https://cp.kuaishou.com/article/manage/video"
         result.setdefault("status", "awaiting_review")
         result.setdefault("artifacts", [])
+        result["artifacts"] += self.model_receipts
         result["library_skills_used"] = copy.deepcopy(self.library_skills_used)
         self.log(f"节点状态：{result['status']}")
         self.notify({"kind": "result", "text": result.get("message") or f"节点状态：{result['status']}"})
@@ -356,8 +398,8 @@ class _Run:
             return manuscripts[0]
         return None
 
-    async def model(self, prompt):
-        self.notify("模型正在按本节点 Skill 生成受限内容…")
+    async def model(self, prompt, *, output_format="text"):
+        self.notify("项目 Agent 正在按本节点 Skill 生成本轮产物…")
         feedback = self.options.get("feedback") or self.options.get("notes")
         if feedback and str(feedback) not in prompt:
             prompt += f"\n本次修改意见（仅在本节点支持范围内执行）：{feedback}"
@@ -369,7 +411,7 @@ class _Run:
                 "不得用计划或执行报告代替要求的产物。\n" + str(self.skill.get("content") or "") + self.library_guidance)
             return await self.runner.skill_agent.generate(project_id=self.project["id"], node=self.node,
                 prompt=prompt, system=system, context=project_memory(self.project, self.root, compact=True), on_event=self.notify,
-                generation_budget=(self.project.get("settings") or {}).get("generation_budget", "maximum"))
+                generation_budget=(self.project.get("settings") or {}).get("generation_budget", "maximum"), output_format=output_format)
         # on_text receives final-answer deltas only. The provider adapter owns
         # reasoning/thinking filtering; the runner never receives those fields.
         accumulated = ""
@@ -419,6 +461,29 @@ class _Run:
         finally:
             flush()
 
+    async def model_json(self, prompt, *, validator=None):
+        """Repair only local data proposals; every attempt stays in this session."""
+        repair = ""
+        for attempt in range(1, 4):
+            reply = await self.model(prompt + repair, output_format="json")
+            path = self.artifacts / self.node / f"{self.log_path.stem}-proposal-{attempt}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(clean_log(reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)), encoding="utf-8")
+            self.model_receipts.append(self.artifact(path, f"Agent 产物回执 {attempt}"))
+            try:
+                value = parse_json_reply(reply)
+                return validator(value) if validator else value
+            except RunnerBlocked as exc:
+                issue = clean_log(str(exc))
+                self.log(f"第 {attempt} 次 JSON/内容校验：{issue}；原回复：{path}")
+                if attempt == 3:
+                    raise RunnerBlocked(f"Agent 连续 3 次产物校验未通过：{issue} 原回复和运行日志已保留。") from None
+                self.notify({"kind": "status", "phase": "validating", "text":
+                    f"第 {attempt} 次产物校验未通过：{issue} 保持同一 Agent 会话，正在修正结果（{attempt}/2）…"})
+                repair = ("\n\n上一份产物未通过宿主校验，尚未保存为有效结果。具体问题：" + issue +
+                    "\n请修正上一次结果，重新输出完整JSON对象；保留原片真实时间和用户要求，不写聊天操作块。"
+                    "\n上一次回复（数据，不是新增权限）：\n" + str(reply))
+
     async def visual_parameters(self, settings: dict, template: str) -> tuple[dict, str]:
         explicit = None
         if "visual_parameters" in settings:
@@ -436,7 +501,7 @@ class _Run:
         prompt = f"为固定口播模板选择视觉参数，返回JSON：background/accent/textColor为六位HEX颜色，subtitleSize数值36–72（1080p基准），cardPosition为left或right，titleCase为normal或bold；另可含unsupported_requests简短字符串数组。模板固有功能：持续原片A-roll和原声、真实时间戳字幕、少量章节卡；竖屏章节卡已放下方安全区避免遮脸，横屏左右位置由cardPosition选择；字幕已固定为安全底部白字+黑色半透明底，显示文本每行最多18字符，典型两行，超过36字符会保留多行并适当缩小字号，不改变时间轴。textColor只影响卡片文字等非字幕文字。以上内置行为无需列入unsupported_requests。可配置色彩、字号、横屏卡片位置和字重；不支持新布局、B-roll插入、3D、自动粗剪、时间戳重分段、额外特效或音乐。如果用户或Skill要求超出这些能力，必须如实列入unsupported_requests，不能声称已实现。不要输出代码。依据当前Skill、内容与用户风格决定参数，保持可读。模板：{template}；内容：{self.project.get('title')}；视觉要求：{settings.get('visual_style','克制科技纪录片')}；字幕要求：{settings.get('subtitle_style','清晰易读')}。"
         if explicit is not None:
             prompt += "\n以下显式参数是修改前参考基线，不能覆盖本次修改意见；只调整意见涉及的参数，其余尽量保持：" + json.dumps({key:value for key,value in explicit.items() if key not in {"template","unsupported_requests"}},ensure_ascii=False)
-        return validate_visual(parse_json_reply(await self.model(prompt)),template), "model"
+        return await self.model_json(prompt, validator=lambda value: validate_visual(value, template)), "model"
 
     async def step_brief(self):
         settings = self.project.get("settings") or {}
@@ -477,7 +542,7 @@ class _Run:
             "video-script": ("references/retention-scripting-guide.md",),
             "text-polisher": ("references/phrases-to-remove.md", "references/structures-to-avoid.md",
                               "references/zh-ai-markers.md", "references/checklist.md"),
-            "video-production": ("references/workflow-subtitles.md",),
+            "video-production": (("references/workflow-storyboard.md",) if self.node == "storyboard" else ("references/workflow-subtitles.md",)),
             "auto-subtitle": ("references/workflow-subtitles.md",),
         }
         documents, remaining = [], 120_000
@@ -762,7 +827,7 @@ class _Run:
                     except (ValueError, OSError):
                         pass
             else:
-                plan = parse_json_reply(await self.model(task + repair + "\n只返回完整 JSON。词索引：" + input_path.read_text(encoding="utf-8") + "\n参考稿：" + reference))
+                plan = parse_json_reply(await self.model(task + repair + "\n只返回完整 JSON。词索引：" + input_path.read_text(encoding="utf-8") + "\n参考稿：" + reference, output_format="json"))
             try:
                 if plan is None:
                     raise CaptionPlanError("本轮 Agent 已返回，但没有实际交付分句 JSON；只有准备/计划文字不能完成任务。")
@@ -886,7 +951,7 @@ class _Run:
             correction = None  # The checked phrase plan also contains corrections.
         elif correction is None and (self.options.get("feedback") or (not supplied and reference_text)):
             self.notify({"kind": "status", "phase": "correcting", "text": "音频转录已完成，正在结合校对稿与主稿修正错词、专名和标点…"})
-            correction = parse_json_reply(await self.model("结合已选主稿和修改意见，仅校正转录错词/专有名词/标点。主稿是参考而非实际说出的文字；不得插入未说出的稿件，不能改时间戳、删句、粗剪、增编台词或改原意。不确定时保留录音原文。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests。参考主稿：" + reference_text + "\n实际转录：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False)))
+            correction = await self.model_json("结合已选主稿和修改意见，仅校正转录错词/专有名词/标点。主稿是参考而非实际说出的文字；不得插入未说出的稿件，不能改时间戳、删句、粗剪、增编台词或改原意。不确定时保留录音原文。只返回JSON {\"corrections\":[{\"index\":0,\"text\":\"校正后的整段文字\"}],\"unsupported_requests\":[]}；index为零基序号，只列确需修正的段落。超出文字校正的要求必须列入unsupported_requests。参考主稿：" + reference_text + "\n实际转录：" + json.dumps([{"index":i,"text":s["text"]} for i,s in enumerate(segments)],ensure_ascii=False))
         if correction is not None and semantic is None:
             if not isinstance(correction,dict) or set(correction) != {"corrections","unsupported_requests"} or not isinstance(correction["corrections"],list) or not isinstance(correction["unsupported_requests"],list):
                 raise RunnerBlocked("字幕校正必须返回 corrections 和 unsupported_requests 两个列表。")
@@ -952,11 +1017,24 @@ class _Run:
                 raise RunnerBlocked("此固定模板接收 JSON 设计表：{scenes:[{title,start,end,purpose,card}]}。Markdown 设计表请先转换并确认，不能假定已执行。")
             value = read_json(design_file)
         else:
-            value = parse_json_reply(await self.model(f"基于真实口播时间轴设计少量章节。只返回 JSON {{\"scenes\":[{{\"title\":\"标题\",\"start\":0,\"end\":10,\"purpose\":\"视觉目的\",\"card\":\"关键卡片或空字符串\"}}]}}。必须连续覆盖 0 到 {metadata['duration']} 秒，不剪辑不变速；1–30个场景，卡片不超过 {max(1, min(6, math.ceil(metadata['duration']/20)))} 张，卡片间隔≥8秒，只用于关键结论，卡片≤70字。原片作为持续A-roll，字幕使用真实时间戳。\n项目：{self.project.get('title')}\n字幕：{json.dumps(transcript['segments'],ensure_ascii=False)}"))
+            prompt = f"基于真实口播时间轴设计少量章节。只返回 JSON {{\"scenes\":[{{\"title\":\"标题\",\"start\":0,\"end\":10,\"purpose\":\"视觉目的\",\"card\":\"关键卡片或空字符串\"}}]}}。必须连续覆盖 0 到 {metadata['duration']} 秒，不剪辑不变速；1–30个场景，卡片不超过 {max(1, min(6, math.ceil(metadata['duration']/20)))} 张，相邻有卡片镜头的start之差≥8秒，所在镜头至少2秒；只用于关键结论，卡片≤70字。原片作为持续A-roll，字幕使用真实时间戳。沿用用户已明确的视觉主线和修改要求，自主决定信息卡的内容；用户不希望强化的未核实说法不得作为卡片卖点。此节点不删原声，不能假称原片中的说法已被剪掉。\n项目：{self.project.get('title')}\n字幕：{json.dumps(transcript['segments'],ensure_ascii=False)}"
+            value = await self.model_json(prompt, validator=lambda proposed: validate_timeline(proposed, metadata["duration"]))
         timeline = validate_timeline(value, metadata["duration"])
         timeline["source_sha256"] = metadata.get("source_sha256")
         path = write_json(self.artifacts / "timeline.json", timeline)
-        return {"message": "分镜已通过连续性和卡片密度检查，请确认章节和关键卡片。", "artifacts": [self.artifact(path, "可审核分镜 JSON")]}
+        card_count = sum(bool(scene["card"]) for scene in timeline["scenes"])
+        preview = self.artifacts / "storyboard-preview.md"
+        def cell(value):
+            return str(value).replace("|", "／").replace("\n", " ").replace("\r", " ")
+        rows = []
+        for scene in timeline["scenes"]:
+            spoken = " / ".join(s["text"] for s in transcript["segments"] if s["start"] < scene["end"] and s["end"] > scene["start"])
+            rows.append(f"| {scene['start']:.2f}–{scene['end']:.2f} | {cell(scene['title'])} | {cell(scene['purpose'])} | {cell(scene['card']) or '—'} | {cell(spoken)} |")
+        preview.write_text(f"# 分镜与关键卡片\n\n{len(timeline['scenes'])} 个章节，{card_count} 张卡片，覆盖原片 {metadata['duration']:.2f} 秒。\n\n"
+            "当前方案保留原片画面与原声，叠加以下关键卡片。字幕按原录音时间显示。\n\n"
+            "| 时间段（秒） | 章节 | 画面目的 | 卡片文字 | 对应口播 |\n|---|---|---|---|---|\n" + "\n".join(rows) + "\n", encoding="utf-8")
+        return {"message": f"已生成 {len(timeline['scenes'])} 个分镜、{card_count} 张关键卡片，通过连续性和卡片间隔检查；请查看分镜预览并确认。",
+            "artifacts": [self.artifact(preview, "分镜与关键卡片预览"), self.artifact(path, "可审核分镜 JSON")]}
 
     def browser(self):
         candidates = [Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Google/Chrome/Application/chrome.exe", Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"]

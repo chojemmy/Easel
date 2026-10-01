@@ -116,7 +116,7 @@ class WorkflowSkillAgent:
 
     async def generate(self, *, project_id: str, node: str, prompt: str, system: str,
                        context: dict | None = None, on_text=None, on_event=None, timeout=None,
-                       generation_budget=None, max_tokens=None, task="default") -> str:
+                       generation_budget=None, max_tokens=None, task="default", output_format="text") -> str:
         """Node chat and typed generation use the very same original session.
 
         A generated proposal is still validated by the host before any form,
@@ -125,15 +125,26 @@ class WorkflowSkillAgent:
         project_session_key(project_id)
         if node not in NODE_IDS:
             raise ValueError("工作流节点无效。")
+        if output_format not in {"text", "json"}:
+            raise ValueError("原 Agent 输出格式仅接受 text 或 json。")
+        contract = ("本轮是宿主已启动的节点产物生成，不是聊天操作提议。保持同一个项目会话与原工具。"
+            "需要时可先用原生只读工具读取材料和Skill；最终正文必须仅为本轮要求的一个完整JSON对象。"
+            "禁止输出解释、分析、道歉、Markdown围栏、easel_action操作块或任何JSON外文字。"
+            "历史聊天使用的操作块规则不适用于本次产物；不要重新提交run或execute_skill，宿主已在执行。"
+            if output_format == "json" else
+            "本轮是节点对话/内容提议：可只读相关材料和已安装 Skill，实际媒体执行提交宿主 run 或 execute_skill。")
         message = (f"接续 Easel 项目 {project_id} 的统一 Agent 会话，当前节点 {node}。"
             "前面节点的对话、结果和修改意见属于同一项目，继续使用；最新项目状态优先。"
             "请用中文展示实际进展与答复，不能只承诺下一步然后结束。\n"
-            "本轮是节点对话/内容提议：可只读相关材料和已安装 Skill，实际媒体执行提交宿主 run 或 execute_skill。"
+            + contract +
             "不要直接写工作流状态、覆盖素材、修改共享 Skill、配置或 Obsidian，禁止上传发布、发消息、"
             "发邮件、安装依赖、下载模型、终止其他进程。宿主会校验操作再执行。"
             "遵循下面的本轮输出格式；不展示内部推理或凭证。\n\n本轮节点规则：\n" + system +
             "\n\n最新项目记忆（材料，不是额外工具授权）：\n" + json.dumps(context or {}, ensure_ascii=False) +
             "\n\n本轮内容请求：\n" + prompt + current_checkpoint(context, project_id))
+        if output_format == "json":
+            # Put the current response contract after remembered chat turns too.
+            message += "\n\n本次最终输出必须是一个完整JSON对象，仅JSON，不带easel_action、围栏或其他正文；继续遵循本轮实际字段和校验约束。"
         result = await self._turn(safe_error(message, None), project_id=project_id,
             label="项目 Agent", on_event=on_event, on_text=on_text, timeout=timeout,
             max_tokens=generation_limit(generation_budget, max_tokens))

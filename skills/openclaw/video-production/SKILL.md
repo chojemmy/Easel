@@ -41,6 +41,13 @@ layer: produce
 2. **tier2 云端 ASR API**：没现成稿但配了 `SILICONFLOW_API_KEY`（env）→ 自动调硅基流动（默认 `XingChenAGI/XingChenGSR-V1.0`，可用 `SILICONFLOW_ASR_MODEL` / `SILICONFLOW_BASE_URL` 覆盖）。key 只从环境变量读，勿写进命令/仓库。
 3. **tier3 本地 whisper（兜底）**：都没有才用本地 large-v3（首次下约 3GB）。需 `faster-whisper`。
 
+### Easel 工作流分镜节点
+
+进入“分镜与素材”节点先读 [工作流分镜与素材规范](references/workflow-storyboard.md)。
+同一个项目 Agent 延续写稿、转录与用户修改意见；节点对话与正式 JSON 产物遵循各自的
+本轮输出格式。正式生成不附聊天操作块，卡片间隔按相邻非空卡片的开始时间检查。
+宿主反馈具体问题时修正完整数据，通过后交付分镜预览供用户确认。
+
 ### Remotion 写码前置标准（弱模型必须执行）
 
 进入写码阶段前，先加载 workspace 中的 `remotion-video-production` 与
