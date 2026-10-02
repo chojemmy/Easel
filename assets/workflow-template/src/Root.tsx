@@ -1,5 +1,5 @@
 import React from 'react';
-import {AbsoluteFill, Composition, interpolate, staticFile, useCurrentFrame, useVideoConfig} from 'remotion';
+import {AbsoluteFill, Composition, interpolate, OffthreadVideo, staticFile, useCurrentFrame, useRemotionEnvironment, useVideoConfig} from 'remotion';
 import {Video} from '@remotion/media';
 
 type Caption = {text: string; startMs: number; endMs: number};
@@ -13,6 +13,7 @@ type Props = {
 
 export const WorkflowVideo: React.FC<Props> = (props) => {
   const frame = useCurrentFrame();
+  const {isRendering} = useRemotionEnvironment();
   const {fps, width, height} = useVideoConfig();
   const second = frame / fps;
   const caption = props.captions.find((c) => c.startMs <= second * 1000 && c.endMs > second * 1000);
@@ -24,7 +25,9 @@ export const WorkflowVideo: React.FC<Props> = (props) => {
   const margin = Math.round(Math.min(width, height) * 0.065);
   const cardFrame = scene ? frame - Math.round(scene.start * fps) : 0;
   return <AbsoluteFill style={{backgroundColor: props.visual.background, color: props.visual.textColor, fontFamily: '"Noto Sans SC", "Microsoft YaHei", sans-serif'}}>
-    <Video src={staticFile(props.source)} style={{width, height, objectFit: 'contain'}} />
+    {isRendering
+      ? <OffthreadVideo src={staticFile(props.source)} style={{width, height, objectFit: 'contain'}} />
+      : <Video src={staticFile(props.source)} objectFit="contain" style={{width, height}} />}
     <AbsoluteFill style={{background: 'linear-gradient(0deg, rgba(0,0,0,0.68), transparent 30%)', pointerEvents: 'none'}} />
     <div style={{position: 'absolute', top: margin, left: margin, fontSize: Math.round(Math.min(width,height)*0.026), letterSpacing: 2, padding: '8px 12px', borderLeft: `4px solid ${props.visual.accent}`, color:'#FFFFFF', backgroundColor: 'rgba(0,0,0,0.6)'}}>{props.title}</div>
     {scene ? <div style={{position:'absolute', ...(portrait ? {bottom:height*0.18,left:margin,width:width-margin*2,boxSizing:'border-box' as const} : {top:height*(editorial ? 0.22 : 0.3),[props.visual.cardPosition]:margin}), maxWidth:portrait ? width-margin*2 : width*0.4, padding: `${margin * 0.55}px ${margin * 0.65}px`, borderTop: `5px solid ${props.visual.accent}`, backgroundColor: props.visual.background, opacity: interpolate(cardFrame, [0, 8], [0, 0.97], {extrapolateLeft:'clamp',extrapolateRight:'clamp'}), transform: `translateY(${interpolate(cardFrame,[0,10],[15,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}px)`, boxShadow: '0 12px 40px rgba(0,0,0,0.25)'}}>

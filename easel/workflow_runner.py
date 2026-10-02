@@ -7,6 +7,7 @@ checked before entering the workflow. Renders keep isolated sources and assets.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import copy
 import hashlib
 import inspect
@@ -40,6 +41,26 @@ def clean_log(text: str) -> str:
         if len(value) >= 8 and re.search(r"(?i)(key|token|secret|password)", name):
             text = text.replace(value, "[REDACTED]")
     return text
+
+
+def remotion_progress(line: str) -> tuple[str, bool] | None:
+    """Expose only recognized counters, never arbitrary browser/tool output."""
+    line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
+    counter = re.match(r"^(Rendered|Encoded)\s+(\d+)/(\d+)(?:\s|,|$)", line)
+    if counter:
+        operation, completed, total = counter.groups()
+        completed, total = int(completed), int(total)
+        if not 0 <= completed <= total or total == 0:
+            return None
+        label = "已渲染" if operation == "Rendered" else "已编码"
+        return f"{label} {completed}/{total} 帧（{completed / total:.0%}）", completed == total
+    bundled = re.match(r"^Bundling(?: code)?\s+(\d+)%", line)
+    if bundled and 0 <= int(bundled[1]) <= 100:
+        return f"正在准备渲染代码：{bundled[1]}%", bundled[1] == "100"
+    copying = re.match(r"^Copying public dir\s+([\d.]+)\s+(kB|KB|MB|GB)\b", line)
+    if copying:
+        return f"正在准备视频素材：{copying[1]} {copying[2]}", False
+    return None
 
 
 def write_json(path: Path, value) -> Path:
@@ -284,7 +305,7 @@ class _Run:
             raise RunnerBlocked(f"{key} 指向的文件不存在。")
         return path
 
-    async def command(self, args, *, cwd=None, timeout=900, env=None, label="工具执行", check=True):
+    async def command(self, args, *, cwd=None, timeout=900, env=None, label="工具执行", check=True, on_output=None):
         args = [str(arg) for arg in args]
         self.notify({"kind": "tool", "text": f"开始：{label}"})
         process_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "NO_COLOR": "1", **(env or {})}
@@ -298,6 +319,8 @@ class _Run:
 
         async def collect():
             chunks = bytearray()
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending = ""
             while True:
                 chunk = await process.stdout.read(16384)
                 if not chunk:
@@ -305,6 +328,13 @@ class _Run:
                 chunks.extend(chunk)
                 if len(chunks) > 2_000_000:
                     del chunks[:len(chunks) - 2_000_000]
+                if on_output is not None:
+                    lines = (pending + decoder.decode(chunk)).replace("\r", "\n").split("\n")
+                    for line in lines[:-1]:
+                        on_output(line)
+                    pending = lines[-1][-4096:]
+            if on_output is not None:
+                on_output(pending + decoder.decode(b"", final=True))
             await process.wait()
             return chunks.decode("utf-8", errors="replace")
 
@@ -542,7 +572,9 @@ class _Run:
             "video-script": ("references/retention-scripting-guide.md",),
             "text-polisher": ("references/phrases-to-remove.md", "references/structures-to-avoid.md",
                               "references/zh-ai-markers.md", "references/checklist.md"),
-            "video-production": (("references/workflow-storyboard.md",) if self.node == "storyboard" else ("references/workflow-subtitles.md",)),
+            "video-production": (("references/workflow-storyboard.md",) if self.node == "storyboard" else
+                                 ("references/workflow-render.md",) if self.node in {"build", "review", "deliver"} else
+                                 ("references/workflow-subtitles.md",)),
             "auto-subtitle": ("references/workflow-subtitles.md",),
         }
         documents, remaining = [], 120_000
@@ -1047,9 +1079,58 @@ class _Run:
                 return candidate
         raise RunnerBlocked("未找到现有 Chrome/Edge；请先配置浏览器，不自动下载。")
 
-    async def remotion(self, command, *args, timeout=7200):
+    async def remotion(self, command, *args, timeout=7200, progress_label=None):
         cli = self.runner.deps / "node_modules/@remotion/cli/remotion-cli.js"
-        return await self.command([shutil.which("node") or "node", cli, command, "src/index.ts", *args, "--browser-executable", self.browser()], cwd=self.work, timeout=timeout, label=f"Remotion {command}")
+        label = progress_label or f"Remotion {command}"
+        last_update, last_message = -math.inf, ""
+
+        def on_output(line):
+            nonlocal last_update, last_message
+            parsed = remotion_progress(line)
+            if parsed is None:
+                return
+            message, finished = parsed
+            current = time.monotonic()
+            if message != last_message and (finished or current - last_update >= 1):
+                self.notify({"kind": "status", "text": f"{label}：{message}"})
+                last_update, last_message = current, message
+
+        return await self.command([shutil.which("node") or "node", cli, command, "src/index.ts", *args, "--browser-executable", self.browser()], cwd=self.work, timeout=timeout, label=label, on_output=on_output)
+
+    def sync_template_sources(self, *, require_existing=False):
+        """Refresh only unchanged host-owned code; never regenerate props here."""
+        template_dir = self.root / "assets/workflow-template"
+        ownership_path = self.work / "template-ownership.json"
+        if require_existing and not ownership_path.is_file():
+            raise RunnerBlocked("缺少模板源码记录，请先运行 Remotion 构建节点。")
+        ownership = read_json(ownership_path) if ownership_path.is_file() else {}
+        existing_files = {path.relative_to(self.work).as_posix(): path
+                          for path in (self.work / "src").rglob("*") if path.is_file()}
+        if not isinstance(ownership, dict):
+            raise RunnerBlocked("模板源码记录无效，请先检查已构建项目。")
+        if set(ownership) - set(existing_files):
+            raise RunnerBlocked("本项目模板源码已被删除，停止覆盖；请先保留并审核源码改动。")
+        for relative, existing in existing_files.items():
+            if ownership.get(relative) != file_sha256(existing):
+                raise RunnerBlocked("本项目模板源码已被编辑，停止覆盖；请先保留并审核源码改动。")
+        template_files = [path for path in (template_dir / "src").rglob("*") if path.is_file()]
+        if not template_files:
+            raise RunnerBlocked("工作流模板源码不存在，停止渲染。")
+        changed = any(not (self.work / path.relative_to(template_dir)).is_file() or
+                      file_sha256(self.work / path.relative_to(template_dir)) != file_sha256(path)
+                      for path in template_files)
+        if not changed:
+            return False
+        if require_existing:
+            backup = self.artifacts / self.node / f"template-before-{uuid.uuid4().hex[:12]}"
+            shutil.copytree(self.work / "src", backup / "src")
+        self.work.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(template_dir / "src", self.work / "src", dirs_exist_ok=True)
+        write_json(ownership_path, {path.relative_to(self.work).as_posix(): file_sha256(path)
+                                   for path in (self.work / "src").rglob("*") if path.is_file()})
+        if require_existing:
+            self.notify({"kind": "status", "text": "已更新当前项目的取帧兼容代码，保留原片、字幕、分镜和已确认的视觉参数。"})
+        return True
 
     async def step_build(self):
         metadata = read_json(self.artifacts / "source-metadata.json")
@@ -1069,19 +1150,8 @@ class _Run:
             if read_json(modules / package / "package.json").get("version") != "4.0.503":
                 raise RunnerBlocked("共享 Remotion 版本须一致为 4.0.503；当前版本不匹配。")
         template_dir = self.root / "assets/workflow-template"
-        self.work.mkdir(parents=True, exist_ok=True)
-        ownership_path = self.work / "template-ownership.json"
-        ownership = read_json(ownership_path) if ownership_path.is_file() else {}
-        for template_file in (template_dir / "src").rglob("*"):
-            if not template_file.is_file():
-                continue
-            relative = Path("src") / template_file.relative_to(template_dir / "src")
-            existing = self.work / relative
-            if existing.is_file() and ownership.get(relative.as_posix()) != file_sha256(existing):
-                raise RunnerBlocked("本项目模板源码已被编辑，停止覆盖；请先保留并审核源码改动。")
-        shutil.copytree(template_dir / "src", self.work / "src", dirs_exist_ok=True)
+        self.sync_template_sources()
         shutil.copy2(template_dir / "package.json", self.work / "package.json")
-        write_json(ownership_path,{path.relative_to(self.work).as_posix():file_sha256(path) for path in (self.work/"src").rglob("*") if path.is_file()})
         if (self.runner.deps / "package-lock.json").is_file():
             shutil.copy2(self.runner.deps / "package-lock.json", self.work / "shared-dependencies.lock.json")
         node_modules = self.work / "node_modules"
@@ -1126,25 +1196,32 @@ class _Run:
         props = read_json(self.work / "props.json")
         if props.get("source_sha256") != await asyncio.to_thread(file_sha256,self.work/"public"/props["source"]):
             raise RunnerBlocked("模板原片已改变，请重新检查素材并构建。")
+        self.sync_template_sources(require_existing=True)
         total = max(1, math.ceil(props["duration"] * 30))
         # Include a non-opening chapter boundary when possible.
         starts = [int(scene["start"]*30) for scene in props["scenes"] if scene.get("card") and scene["start"] > 0]
         start = max(0, (starts[0]-60) if starts else 0)
         end = min(total-1, start+min(360,total)-1)
-        preview = self.artifacts / "preview.mp4"
-        await self.remotion("render", "WorkflowVideo", preview, "--props", self.work / "props.json", "--frames", f"{start}-{end}", "--scale", "0.5", "--crf", "30", "--concurrency", "2")
-        await self.probe(preview)
+        # Unique outputs prevent a prior successful/partial render from masking
+        # a missing file in this run, and leave earlier human-review media intact.
+        review_dir = self.artifacts / "review" / f"run-{uuid.uuid4().hex[:12]}"
+        review_dir.mkdir(parents=True, exist_ok=False)
+        preview = review_dir / "preview.mp4"
+        await self.remotion("render", "WorkflowVideo", preview, "--props", self.work / "props.json", "--frames", f"{start}-{end}", "--scale", "0.5", "--crf", "30", "--concurrency", "2", progress_label="渲染样片")
+        metadata = await self.probe(preview)
+        expected_duration = (end-start+1)/30
+        if abs(metadata["duration"] - expected_duration) > .15:
+            raise RunnerBlocked("样片时长与请求的原片范围不符，请查看运行日志。")
+        await self.command(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", preview, "-f", "null", "-"], timeout=900, label="完整解码样片并检查音视频")
         frame_set = {0, total-1}
         for scene in props["scenes"]:
             first, last = round(scene["start"]*30), round(scene["end"]*30)
             frame_set.update(frame for frame in (first-1,first,first+1,last-1) if 0 <= frame < total)
-        frames = []
-        for frame in sorted(frame_set):
-            path = self.artifacts / "review-frames" / f"frame-{frame:06d}.png"
-            path.parent.mkdir(exist_ok=True)
-            await self.remotion("still", "WorkflowVideo", path, "--props", self.work / "props.json", "--frame", str(frame), "--scale", "0.5", timeout=600)
-            frames.append(self.artifact(path, f"边界帧 {frame}", "inspection_frame"))
-        report = write_json(self.artifacts / "review-report.json", {"preview_seconds":(end-start+1)/30,"source_range_seconds":[start/30,(end+1)/30],"boundary_frames":sorted(frame_set),"decode":"passed","human_visual_review":"pending","timeline_mode":"original_no_cuts","checks":["字幕首中尾及章节边界同步","卡片不遮挡面部和原有字幕","文字在手机尺寸清晰可读"]})
+        frame_dir = review_dir / "frames"
+        await self.remotion("render", "WorkflowVideo", frame_dir, "--props", self.work / "props.json", "--frames", ",".join(str(frame) for frame in sorted(frame_set)), "--sequence", "--image-format", "png", "--image-sequence-pattern", "frame-[frame].[ext]", "--muted", "--scale", "0.5", "--concurrency", "2", timeout=900, progress_label="检查章节边界")
+        pad = len(str(max(frame_set)))
+        frames = [self.artifact(frame_dir / f"frame-{frame:0{pad}d}.png", f"边界帧 {frame}", "inspection_frame") for frame in sorted(frame_set)]
+        report = write_json(review_dir / "review-report.json", {"preview_seconds":expected_duration,"source_range_seconds":[start/30,(end+1)/30],"boundary_frames":sorted(frame_set),"decoder":"offthread_ffmpeg","metadata":metadata,"decode":"passed","human_visual_review":"pending","timeline_mode":"original_no_cuts","checks":["字幕首中尾及章节边界同步","卡片不遮挡面部和原有字幕","文字在手机尺寸清晰可读"]})
         return {"message":"样片与章节边界静帧已生成，等待你观看确认；自动检查不代替视觉验收。", "artifacts":[self.artifact(preview,"低清样片","preview_video"),*frames,self.artifact(report,"样片检查报告")]}
 
     async def step_deliver(self):
@@ -1159,6 +1236,7 @@ class _Run:
             props = read_json(self.work / "props.json")
             if props.get("source_sha256") != await asyncio.to_thread(file_sha256,self.work/"public"/props["source"]):
                 raise RunnerBlocked("模板原片已改变，请重新检查素材并构建。")
+            self.sync_template_sources(require_existing=True)
             await self.remotion("render", "WorkflowVideo", final, "--props", self.work / "props.json", "--codec", "h264", "--crf", "18", "--concurrency", "2")
             origin = "rendered_template"
         metadata = await self.probe(final)

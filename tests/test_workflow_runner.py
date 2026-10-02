@@ -183,6 +183,12 @@ def test_deliver_does_not_implicitly_reimport_prior_final(case,monkeypatch):
     public.mkdir(parents=True)
     (public/"source.mp4").write_bytes(b"source")
     module.write_json(case[1]/"remotion/props.json",{"source":"source.mp4","source_sha256":module.file_sha256(public/"source.mp4")})
+    template=case[0]/"assets/workflow-template"
+    shutil.copytree(Path(__file__).resolve().parents[1]/"assets/workflow-template",template)
+    work=public.parent
+    shutil.copytree(template/"src",work/"src")
+    module.write_json(work/"template-ownership.json",{path.relative_to(work).as_posix():module.file_sha256(path)
+                                                      for path in (work/"src").rglob("*") if path.is_file()})
     called=[]
     async def remotion(self,*args,**kwargs):
         called.append(args)
@@ -493,13 +499,17 @@ def test_real_sdk_template_render_smoke(monkeypatch):
     base=root/"outputs/视频工作流"
     base.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="runner-smoke-",dir=base) as temp:
-        directory=Path(temp)
+        directory=Path(temp)/("wf-"+module.uuid.uuid4().hex[:12])
+        directory.mkdir()
         source=directory/"source.mp4"
         subprocess.run(["ffmpeg","-y","-v","error","-f","lavfi","-i","testsrc2=size=640x360:rate=30:duration=4","-f","lavfi","-i","sine=frequency=440:sample_rate=48000:duration=4","-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac","-shortest",str(source)],check=True)
         subtitle=directory/"source.srt"
         subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\n真实时间戳字幕\n\n2\n00:00:02,000 --> 00:00:04,000\n固定流程可以复现\n",encoding="utf-8")
         project={"id":directory.name,"kind":"video","title":"流程渲染验证","content_version":1,"settings":{"template":"documentary"},"media":{"source_path":str(source),"transcript_path":str(subtitle)}}
-        async def model(*args,**kwargs):return {"background":"#152020","accent":"#D4AF72","textColor":"#FFFFFF","subtitleSize":54,"cardPosition":"left","titleCase":"bold"}
+        async def model(prompt,**kwargs):
+            if "word-index.json" in prompt:
+                return {"lines":["真实时间戳字幕","固定流程可以复现"],"unsupported_requests":[]}
+            return {"background":"#152020","accent":"#D4AF72","textColor":"#FFFFFF","subtitleSize":54,"cardPosition":"left","titleCase":"bold"}
         monkeypatch.setattr(module,"generate",model)
         runner=WorkflowRunner(root)
         async def run():

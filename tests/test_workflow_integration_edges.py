@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from easel.content_workflow import ContentWorkflowService, node_of
 from easel.content_workflow_api import router
-from easel.workflow_runner import WorkflowRunner, _Run
+from easel.workflow_runner import WorkflowRunner, _Run, file_sha256, write_json
 
 
 @pytest.fixture
@@ -82,6 +83,11 @@ def test_redelivery_renders_new_props_instead_of_reimporting_its_old_final(servi
         (work / "public").mkdir(parents=True)
         source = work / "public" / "source.mp4"
         source.write_bytes(b"registered-original-recording")
+        template = service.root / "assets/workflow-template"
+        shutil.copytree(Path(__file__).resolve().parents[1] / "assets/workflow-template", template)
+        shutil.copytree(template / "src", work / "src")
+        write_json(work / "template-ownership.json", {path.relative_to(work).as_posix(): file_sha256(path)
+                                                    for path in (work / "src").rglob("*") if path.is_file()})
         (work / "props.json").write_text(json.dumps({
             "source": source.name, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "duration": 4, "width": 1920, "height": 1080, "fps": 30,

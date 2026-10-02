@@ -50,6 +50,10 @@ layer: produce
 
 ### Remotion 写码前置标准（弱模型必须执行）
 
+Easel 的“Remotion 构建”“样片验收”“成片交付”先读
+[工作流渲染与取帧规范](references/workflow-render.md)。取帧超时先核对原片和实际解码器，
+不要重写分镜、丢弃字幕或反复调用模型。渲染进度来自工具实际计数，执行完仍须经过样片验收。
+
 进入写码阶段前，先加载 workspace 中的 `remotion-video-production` 与
 `remotion-best-practices` 两个 Skill。前者规定分镜、B-roll、字幕、卡片与质量门，
 后者提供 Remotion 官方当前 API 与 React 写法。不得跳过下列顺序：
