@@ -23,6 +23,7 @@ BGM 自动循环补足并可"闪避"（ducking：旁白说话时自动压低 BGM
 from __future__ import annotations
 
 import argparse
+import math
 import shutil
 import subprocess
 import sys
@@ -54,7 +55,7 @@ def _prep_out(path: str) -> Path:
 
 
 def _run(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-18:])
         _die(f"ffmpeg 执行失败（exit {proc.returncode}）:\n{tail}", proc.returncode or 1)
@@ -73,11 +74,15 @@ def _dur(path: Path) -> float:
 
 def _done(out: Path, extra: str = "") -> None:
     kb = out.stat().st_size / 1024 if out.is_file() else 0
-    print(f"✅ {out} ({kb:.0f} KB){(' ' + extra) if extra else ''}")
+    print(f"OK {out} ({kb:.0f} KB){(' ' + extra) if extra else ''}")
 
 
 def cmd_mix(a) -> int:
     _check_ffmpeg()
+    for field in ("bgm_fade_in", "bgm_fade_out", "master_fade_out"):
+        value = getattr(a, field, 1.5 if field == "master_fade_out" else 0.0)
+        if not math.isfinite(value) or value < 0:
+            _die(f"{field} 必须为非负有限秒数", 2)
     sfx = a.sfx or []
     sfx_at = a.sfx_at or []
     if sfx and len(sfx_at) not in (0, len(sfx)):
@@ -118,6 +123,16 @@ def cmd_mix(a) -> int:
         loop_args = [] if a.bgm_loop_off else ["-stream_loop", "-1"]
         inputs += [*loop_args, "-i", str(_require(a.bgm))]
         filt.append(f"[{idx}:a]volume={a.bgm_volume},aresample=44100[bgm0]")
+        fade_in = getattr(a, "bgm_fade_in", 0.0)
+        fade_out = getattr(a, "bgm_fade_out", 0.0)
+        fades = []
+        if fade_in > 0:
+            fades.append(f"afade=t=in:st=0:d={min(fade_in,target):.6f}")
+        if fade_out > 0:
+            fade_out = min(fade_out, target)
+            fades.append(f"afade=t=out:st={target-fade_out:.6f}:d={fade_out:.6f}")
+        if fades:
+            filt[-1] = filt[-1].replace("[bgm0]", f",{','.join(fades)}[bgm0]")
         idx += 1
         if voice_label and not a.no_duck:
             # 复制旁白作 sidechain 控制信号
@@ -149,8 +164,11 @@ def cmd_mix(a) -> int:
         filt.append(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:"
                     f"duration=longest:normalize=0:dropout_transition=0[mixout]")
     # 末尾淡出，避免 BGM 硬切
-    fade = min(1.5, target / 4)
-    filt.append(f"[mixout]afade=t=out:st={max(0.0, target - fade):.3f}:d={fade:.3f}[out]")
+    fade = min(getattr(a, "master_fade_out", 1.5), target / 4)
+    if fade > 0:
+        filt.append(f"[mixout]afade=t=out:st={max(0.0, target - fade):.3f}:d={fade:.3f}[out]")
+    else:
+        filt.append("[mixout]anull[out]")
 
     out = _prep_out(a.output)
     _run(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(filt),
@@ -198,7 +216,7 @@ def cmd_selftest(_a) -> int:
                                    duration=None, output=str(out3)))
         assert 9.0 < _dur(out3) < 11.0, "仅 BGM 时长应≈10s"
 
-    print("✅ selftest 全部通过（旁白+BGM闪避 / 定时音效 / 仅BGM）")
+    print("OK selftest 全部通过（旁白+BGM闪避 / 定时音效 / 仅BGM）")
     return 0
 
 
@@ -209,6 +227,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("mix", help="多轨混音")
+    p.add_argument("--bgm-fade-in", type=float, default=0.0, help="仅音乐淡入秒数（默认 0）")
+    p.add_argument("--bgm-fade-out", type=float, default=0.0, help="仅音乐淡出秒数（默认 0）")
+    p.add_argument("--master-fade-out", type=float, default=1.5, help="混音总轨淡出秒数；设 0 保留最后的人声")
     p.add_argument("--voice", help="旁白/口播主轨（决定输出时长）")
     p.add_argument("--voice-volume", type=float, default=1.0, help="旁白音量（默认 1.0）")
     p.add_argument("--bgm", help="背景音乐（自动循环补足）")

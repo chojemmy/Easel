@@ -1,14 +1,16 @@
 import React from 'react';
-import {AbsoluteFill, Composition, interpolate, OffthreadVideo, staticFile, useCurrentFrame, useRemotionEnvironment, useVideoConfig} from 'remotion';
-import {Video} from '@remotion/media';
+import {AbsoluteFill, Composition, Html5Audio, interpolate, OffthreadVideo, staticFile, useCurrentFrame, useRemotionEnvironment, useVideoConfig} from 'remotion';
+import {Audio, Video} from '@remotion/media';
 
 type Caption = {text: string; startMs: number; endMs: number};
 type Scene = {title: string; start: number; end: number; purpose: string; card: string};
 type Props = {
   source: string; title: string; duration: number; width: number; height: number; fps: number;
+  playbackRate?: number;
+  mixedAudio?: string;
   captions: Caption[]; scenes: Scene[];
   visual: {template: 'documentary'|'editorial'; background: string; accent: string;
-    textColor: string; subtitleSize: number; cardPosition: 'left'|'right'; titleCase: 'normal'|'bold'};
+    textColor: string; subtitleSize: number; subtitleBottom?: number; cardPosition: 'left'|'right'; titleCase: 'normal'|'bold'};
 };
 
 export const WorkflowVideo: React.FC<Props> = (props) => {
@@ -23,18 +25,22 @@ export const WorkflowVideo: React.FC<Props> = (props) => {
   const editorial = props.visual.template === 'editorial';
   const portrait = height > width;
   const margin = Math.round(Math.min(width, height) * 0.065);
+  const subtitleBottom = props.visual.subtitleBottom === undefined ? margin : height * props.visual.subtitleBottom;
   const cardFrame = scene ? frame - Math.round(scene.start * fps) : 0;
   return <AbsoluteFill style={{backgroundColor: props.visual.background, color: props.visual.textColor, fontFamily: '"Noto Sans SC", "Microsoft YaHei", sans-serif'}}>
     {isRendering
-      ? <OffthreadVideo src={staticFile(props.source)} style={{width, height, objectFit: 'contain'}} />
-      : <Video src={staticFile(props.source)} objectFit="contain" style={{width, height}} />}
+      ? <OffthreadVideo src={staticFile(props.source)} muted={!!props.mixedAudio} playbackRate={props.playbackRate ?? 1} style={{width, height, objectFit: 'contain'}} />
+      : <Video src={staticFile(props.source)} muted={!!props.mixedAudio} playbackRate={props.playbackRate ?? 1} objectFit="contain" style={{width, height}} />}
+    {props.mixedAudio ? isRendering
+      ? <Html5Audio src={staticFile(props.mixedAudio)} />
+      : <Audio src={staticFile(props.mixedAudio)} /> : null}
     <AbsoluteFill style={{background: 'linear-gradient(0deg, rgba(0,0,0,0.68), transparent 30%)', pointerEvents: 'none'}} />
     <div style={{position: 'absolute', top: margin, left: margin, fontSize: Math.round(Math.min(width,height)*0.026), letterSpacing: 2, padding: '8px 12px', borderLeft: `4px solid ${props.visual.accent}`, color:'#FFFFFF', backgroundColor: 'rgba(0,0,0,0.6)'}}>{props.title}</div>
-    {scene ? <div style={{position:'absolute', ...(portrait ? {bottom:height*0.18,left:margin,width:width-margin*2,boxSizing:'border-box' as const} : {top:height*(editorial ? 0.22 : 0.3),[props.visual.cardPosition]:margin}), maxWidth:portrait ? width-margin*2 : width*0.4, padding: `${margin * 0.55}px ${margin * 0.65}px`, borderTop: `5px solid ${props.visual.accent}`, backgroundColor: props.visual.background, opacity: interpolate(cardFrame, [0, 8], [0, 0.97], {extrapolateLeft:'clamp',extrapolateRight:'clamp'}), transform: `translateY(${interpolate(cardFrame,[0,10],[15,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}px)`, boxShadow: '0 12px 40px rgba(0,0,0,0.25)'}}>
+    {scene ? <div style={{position:'absolute', ...(portrait ? {bottom:Math.max(height*0.18, subtitleBottom + subtitleSize*3.2 + 36),left:margin,width:width-margin*2,boxSizing:'border-box' as const} : {top:height*(editorial ? 0.22 : 0.3),[props.visual.cardPosition]:margin}), maxWidth:portrait ? width-margin*2 : width*0.4, padding: `${margin * 0.55}px ${margin * 0.65}px`, borderTop: `5px solid ${props.visual.accent}`, backgroundColor: props.visual.background, opacity: interpolate(cardFrame, [0, 8], [0, 0.97], {extrapolateLeft:'clamp',extrapolateRight:'clamp'}), transform: `translateY(${interpolate(cardFrame,[0,10],[15,0],{extrapolateLeft:'clamp',extrapolateRight:'clamp'})}px)`, boxShadow: '0 12px 40px rgba(0,0,0,0.25)'}}>
       <div style={{fontSize: Math.round(Math.min(width,height)*0.025), color: props.visual.accent, marginBottom: 14}}>{scene.title}</div>
       <div style={{fontSize: Math.round(Math.min(width,height)*(portrait ? (scene.card.length>45 ? 0.038 : 0.045) : editorial ? 0.055 : 0.048)), lineHeight:1.35, fontWeight: props.visual.titleCase === 'bold' ? 800 : 600, whiteSpace:'pre-wrap', textWrap:'balance'}}>{scene.card}</div>
     </div> : null}
-    {caption ? <div style={{position:'absolute', left:margin, right:margin, bottom:margin, display:'flex', justifyContent:'center'}}>
+    {caption ? <div style={{position:'absolute', left:margin, right:margin, bottom:subtitleBottom, display:'flex', justifyContent:'center'}}>
       <div style={{fontSize:Math.max(Math.round(Math.min(width,height)*32/1080),Math.round(subtitleSize*Math.min(1,2/captionLines))), fontWeight:650, lineHeight:1.45, textAlign:'center', whiteSpace:'pre-wrap', maxWidth:'100%', padding:'10px 22px', borderRadius:8, color:'#FFFFFF', backgroundColor:'rgba(0,0,0,0.76)', textShadow:'0 2px 4px #000'}}>{caption.text}</div>
     </div> : null}
   </AbsoluteFill>;

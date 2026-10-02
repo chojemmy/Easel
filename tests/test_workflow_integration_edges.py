@@ -91,17 +91,28 @@ def test_redelivery_renders_new_props_instead_of_reimporting_its_old_final(servi
         (work / "props.json").write_text(json.dumps({
             "source": source.name, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "duration": 4, "width": 1920, "height": 1080, "fps": 30,
-            "captions": [], "scenes": [], "visual": {"template": "editorial"},
+            "captions": [], "scenes": [], "visual": {"template": "editorial","subtitleSize":48,
+                "background":"#E9E4DB","accent":"#768275","textColor":"#172120","cardPosition":"left","titleCase":"bold"},
         }), encoding="utf-8")
         project["media"]["final_path"] = str(old_final)
-        node_of(project, "review")["status"] = "completed"
+        from easel.workflow_render_settings import preferences_for
+        props=json.loads((work/"props.json").read_text(encoding="utf-8"))
+        snapshot=artifacts/"approved-props.json"
+        write_json(snapshot,props)
+        prefs=preferences_for(props,{})
+        project['settings']['render_preferences']=prefs
+        node_of(project, "review").update(status="completed",version=2,approved_version=2,
+            render_receipt={"version":2,"preferences":prefs,"props_path":str(snapshot),
+            "props_sha256":file_sha256(snapshot),"base_props_sha256":file_sha256(work/"props.json"),
+            "source_sha256":props['source_sha256'],"duration_seconds":4,"music":None,"requests":[]})
         service.save(project)
         await service.run(project["id"], "deliver", {})
         await service.tasks[project["id"]]
         current = service.get(project["id"])
         assert node_of(current, "deliver")["status"] == "awaiting_review", node_of(current, "deliver")["message"]
         assert rendered == ["render"]
-        assert old_final.read_bytes() == b"new-render-for-current-props"
+        assert Path(current['media']['final_path']).read_bytes() == b"new-render-for-current-props"
+        assert old_final.read_bytes() == b"old-render"
 
     asyncio.run(scenario())
 

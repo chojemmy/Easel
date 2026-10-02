@@ -17,12 +17,14 @@ from .workflow_model import WorkflowModel
 from .workflow_skill_catalog import WorkflowSkillCatalog
 from .workflow_agent_context import project_memory
 from .workflow_skill_agent import WorkflowSkillAgentTruncated
+from .workflow_render_settings import validate_preferences
 
 SETTINGS = {
     "transcript": {"subtitle_max_chars"},
     "storyboard": {"visual_style"},
-    "build": {"template", "output_ratio", "visual_style", "subtitle_style"},
-    "deliver": {"publish_title", "publish_description", "publish_tags"},
+    "build": {"template", "output_ratio", "visual_style", "subtitle_style", "render_preferences"},
+    "review": {"render_preferences"},
+    "deliver": {"publish_title", "publish_description", "publish_tags", "render_preferences"},
     "publish": {"publish_title", "publish_description", "publish_tags", "publish_platform"},
     "archive": {"archive_folder"},
 }
@@ -210,6 +212,8 @@ def native_instructions(node: str, skill: dict) -> str:
 chat只讨论；update填写当前节点；draft仅用于script，正文就是完整新稿，manuscript_title为标题；run只用于用户明确要求执行当前节点，承诺立即执行就必须提交run。
 execute_skill用于当前节点需要原Skill工具、且固定节点执行不足的任务，填写skill_name和task，宿主会校验权限并委托同一原Agent；转录生成字幕优先run。
 当前允许填写的updates字段：{json.dumps(fields, ensure_ascii=False)}。禁止修改其他节点、确认状态、ID或Skill。
+画面、预览和成片节点的制作修改使用run，feedback保留具体要求；宿主会读取未完成对话的原始要求，由同一Agent生成受限制作参数和真实新样片。渲染实际完成前只说正在准备，不能声称已渲染。成片阶段有新制作意见时先生成新样片，等待确认后才导出全片。
+settings.render_preferences为对象，可填写subtitle_size(36–96)、subtitle_bottom(.025–.30距底部占画面高度)、playback_rate(.5–2)、bgm_enabled(布尔)、bgm_track(auto或库中曲目文件名)、bgm_volume(0–.20)、bgm_fade_in/out(0–5秒)、background/accent/text_color(六位HEX)、card_position(left/right)、title_case(normal/bold)。不要编造路径。样片页面的版本和制作参数执行回执才是实际结果。
 media路径必须是用户明确提供且存在的真实路径，不猜路径。transcript_path为时间戳字幕，transcript_reference_path为TXT/Markdown参考稿。
 字幕字数subtitle_max_chars必须为8–40整数，默认12。转录已有主稿和原视频时读取主稿校对；纯文本不需要时间戳，run会发现本地模型或复用词级ASR，生成字幕时间。不要因缺SRT要求用户重复交稿或下载模型。
 用户要求重新分句/字幕校对时把具体要求写入feedback，宿主与同一Agent接续执行，不仅回复计划。实际完成以宿主校验回执为准。
@@ -228,8 +232,13 @@ def updates_for(project: dict, node: str, result: dict, user_text: str) -> dict:
         if key == "title":
             continue
         fields = BRIEF if key == "brief" else SETTINGS.get(node, set()) if key == "settings" else {"source_path"} if node == "source" else {"transcript_path", "transcript_reference_path"}
-        if not isinstance(value, dict) or set(value) - fields or any(not isinstance(v, (str, int, float)) or isinstance(v, bool) for v in value.values()):
+        if not isinstance(value, dict) or set(value) - fields:
             raise ValueError("助手返回了当前节点不支持的字段或值")
+        for field, item in value.items():
+            if key == "settings" and field == "render_preferences":
+                validate_preferences(item)
+            elif not isinstance(item, (str, int, float)) or isinstance(item, bool):
+                raise ValueError("助手返回了当前节点不支持的字段或值")
         if key == "media":
             for field, path in value.items():
                 if not isinstance(path, str) or (path not in user_text and path != project["media"].get(field)):

@@ -25,7 +25,7 @@ def current_checkpoint(context: dict | None, project_id: str) -> str:
     settings = memory.get("settings") or {}
     facts = {"project_title": memory.get("title"), "primary_manuscript_id": primary.get("id"),
         "primary_manuscript_title": primary.get("title"),
-        "saved_settings": {key: settings[key] for key in ("subtitle_max_chars", "subtitle_style", "visual_style", "output_ratio") if key in settings},
+        "saved_settings": {key: settings[key] for key in ("subtitle_max_chars", "subtitle_style", "visual_style", "output_ratio", "render_preferences") if key in settings},
         "current_node_results": [{"node": n["id"], "status": n.get("status"), "message": n.get("message", "")}
                                  for n in memory.get("nodes", [])]}
     return ("\n\n当前已保存的项目事实（读取表单和宿主结果，不是历史助手的推断）：\n" +
@@ -41,6 +41,8 @@ def project_memory(project: dict, root: Path | None = None, *, compact: bool = F
         nodes.append({"id": node["id"], "title": node.get("title"), "status": node.get("status"),
             "version": node.get("version"), "approved_version": node.get("approved_version"),
             "message": node.get("message", ""), "artifacts": node.get("artifacts", [])[-12:],
+            "render_receipt": {key: node["render_receipt"].get(key) for key in
+                ("version", "preferences", "props_path", "props_sha256")} if node.get("render_receipt") else None,
             "feedback": [{"text": f.get("text", ""), "applied_run_id": f.get("applied_run_id")}
                          for f in node.get("feedback", [])[-20:]]})
         for message in node.get("chat", {}).get("messages", []):

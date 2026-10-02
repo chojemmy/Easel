@@ -18,7 +18,7 @@ const PROMPTS: Record<WorkflowNodeId, string> = {
 };
 const activityLabel = { status: '进展', generation: '正在生成', tool: '工具', result: '结果', error: '需处理' };
 const time = (value?: string) => value ? new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '';
-const phaseLabel: Record<string, string> = { preparing: '准备材料与工具', transcribing: '转录音频', correcting: '校对字幕', segmenting: '语义分句与字幕校对', validating: '检查并保存产物' };
+const phaseLabel: Record<string, string> = { preparing: '准备材料与工具', rendering: '渲染与编码', inspecting: '检查新版本', transcribing: '转录音频', correcting: '校对字幕', segmenting: '语义分句与字幕校对', validating: '检查并保存产物' };
 const executionLabel: Record<string, string> = { starting: '正在启动任务', running: '任务执行中', queued: '任务排队中', completed: '任务已完成', awaiting_review: '已生成，待你确认', blocked: '任务已停止 · 需处理', failed: '任务执行失败', stopped: '任务已停止', interrupted: '任务已中断' };
 const elapsed = (start: string | undefined, end: string | undefined, tick: number) => {
   if (!start) return '';

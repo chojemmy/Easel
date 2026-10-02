@@ -1,7 +1,13 @@
 /** The content workflow has its own durable projects; chat sessions are not jobs. */
 export type WorkflowKind = 'video' | 'article';
 export type WorkflowNodeId = 'brief' | 'script' | 'source' | 'transcript' | 'storyboard' | 'build' | 'review' | 'deliver' | 'publish' | 'archive';
-export interface WorkflowArtifact { name: string; path: string; url?: string; kind?: string; }
+export interface WorkflowArtifact { name: string; path: string; url?: string; kind?: string; sha256?: string; version?: number; run_id?: string; }
+export interface WorkflowRenderReceipt {
+  version: number; run_id: string; duration_seconds: number; props_sha256: string;
+  preferences: Record<string, string | number | boolean>;
+  music?: { title: string; source_site?: string; license?: string } | null;
+  requests?: { id: string; text: string }[];
+}
 export interface WorkflowRun { id?: string; status?: string; message?: string; started_at?: string; finished_at?: string; log?: string; }
 export interface WorkflowExecution extends WorkflowRun { phase?: string; updated_at?: string; run_id?: string; }
 export interface WorkflowSkillUse { name: string; path: string; sha256?: string; }
@@ -13,6 +19,7 @@ export interface WorkflowNode {
   approved_version?: number; artifacts: WorkflowArtifact[]; runs: WorkflowRun[];
   feedback: WorkflowFeedback[]; skill_version?: string; current_skill_version?: string; skill_updated?: boolean; skill_error?: string;
   publication_uncertain?: boolean; progress?: number; updated_at?: string; phase?: string;
+  render_receipt?: WorkflowRenderReceipt;
   chat?: { status: 'idle' | 'running' | 'failed' | 'stopped'; messages: WorkflowChatMessage[]; error?: string; [key: string]: unknown };
   activity?: WorkflowActivity[];
 }

@@ -165,6 +165,7 @@ def _stages(name: str, description: str, layer: str) -> list[str]:
         "video-production": {"source", "transcript", "storyboard", "build", "review", "deliver"},
         "remotion-video-production": {"storyboard", "build", "review", "deliver"},
         "remotion-best-practices": {"storyboard", "build", "review", "deliver"},
+        "audio-mix": {"transcript", "storyboard", "build", "review", "deliver"},
         "asset-manager": {"source", "storyboard", "build", "deliver", "archive"},
         "template-library": {"storyboard", "build", "deliver"},
         "obsidian-knowledge-flywheel": {"brief", "script", "archive"},

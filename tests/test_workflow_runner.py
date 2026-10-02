@@ -189,10 +189,20 @@ def test_deliver_does_not_implicitly_reimport_prior_final(case,monkeypatch):
     shutil.copytree(template/"src",work/"src")
     module.write_json(work/"template-ownership.json",{path.relative_to(work).as_posix():module.file_sha256(path)
                                                       for path in (work/"src").rglob("*") if path.is_file()})
+    # The export must use the approved snapshot, never the previous final_path.
+    from easel.workflow_render_settings import preferences_for
+    props=module.read_json(work/"props.json")
+    props.update(duration=4,width=640,height=360,fps=30,captions=[],scenes=[],visual={"subtitleSize":48,"background":"#182020","accent":"#D1B479","textColor":"#FFFFFF","cardPosition":"left","titleCase":"bold"})
+    module.write_json(work/"props.json",props)
+    snapshot=module.write_json(case[1]/"artifacts/approved-props.json",props)
+    prefs=preferences_for(props,{})
+    receipt={"version":2,"preferences":prefs,"props_path":str(snapshot),"props_sha256":module.file_sha256(snapshot),"base_props_sha256":module.file_sha256(work/"props.json"),"source_sha256":props["source_sha256"],"duration_seconds":4,"music":None,"requests":[]}
+    case[2]["settings"]["render_preferences"]=prefs
+    case[2]["nodes"]=[{"id":"review","status":"completed","version":2,"approved_version":2,"render_receipt":receipt}]
     called=[]
     async def remotion(self,*args,**kwargs):
         called.append(args)
-        (self.artifacts/"final.mp4").write_bytes(b"new-video")
+        Path(args[2]).write_bytes(b"new-video")
     async def probe(*args):return {"duration":4,"width":640,"height":360}
     async def command(self,args,**kwargs):
         if "-frames:v" in args:Path(args[-1]).write_bytes(b"cover")
@@ -202,7 +212,9 @@ def test_deliver_does_not_implicitly_reimport_prior_final(case,monkeypatch):
     monkeypatch.setattr(module._Run,"command",command)
     result=execute(case,"deliver")
     assert called and result["status"]=="awaiting_review"
-    assert (case[1]/"artifacts/final.mp4").read_bytes()==b"new-video"
+    assert Path(result["media"]["final_path"]).read_bytes()==b"new-video"
+    assert Path(called[0][called[0].index("--props")+1])==snapshot
+    assert old.read_bytes()==b"old-video"
 
 
 def test_storyboard_refuses_transcript_from_other_source(case):
@@ -506,6 +518,13 @@ def test_real_sdk_template_render_smoke(monkeypatch):
         subtitle=directory/"source.srt"
         subtitle.write_text("1\n00:00:00,000 --> 00:00:02,000\n真实时间戳字幕\n\n2\n00:00:02,000 --> 00:00:04,000\n固定流程可以复现\n",encoding="utf-8")
         project={"id":directory.name,"kind":"video","title":"流程渲染验证","content_version":1,"settings":{"template":"documentary"},"media":{"source_path":str(source),"transcript_path":str(subtitle)}}
+        library=directory/"music-library"
+        library.mkdir()
+        bgm=library/"test-tone.mp3"
+        subprocess.run(["ffmpeg","-nostdin","-y","-v","error","-f","lavfi","-i","sine=frequency=1000:sample_rate=44100:duration=10",str(bgm)],check=True)
+        module.write_json(library/"library.json",{"tracks":[{"file":bgm.name,"title":"Generated test tone","sha256":module.file_sha256(bgm),"license":"Locally generated test fixture","tags":["ambient"]}]})
+        monkeypatch.setenv("BGM_LIBRARY_DIR",str(library))
+        project["settings"]["render_preferences"]={"subtitle_size":64,"subtitle_bottom":.12,"playback_rate":1.1,"bgm_enabled":True,"bgm_volume":.1}
         async def model(prompt,**kwargs):
             if "word-index.json" in prompt:
                 return {"lines":["真实时间戳字幕","固定流程可以复现"],"unsupported_requests":[]}
@@ -517,6 +536,11 @@ def test_real_sdk_template_render_smoke(monkeypatch):
                 result=await runner.execute(project,node,options,{"content":"暖灰、清晰大字幕，保留原片。"},directory,lambda text:None)
                 assert result["status"] in {"completed","awaiting_review"},f"{node}: {result['message']}"
                 project["media"].update(result.get("media") or {})
-            assert (directory/"artifacts/final.mp4").stat().st_size>10000
-            assert json.loads((directory/"artifacts/delivery-report.json").read_text(encoding="utf-8"))["decode"]=="passed"
+                project["settings"].update(result.get("settings") or {})
+                if node=="review":
+                    project["nodes"]=[{"id":"review","status":"completed","version":result["render_receipt"]["version"],
+                        "approved_version":result["render_receipt"]["version"],"render_receipt":result["render_receipt"]}]
+            assert Path(project["media"]["final_path"]).stat().st_size>10000
+            report=next(Path(a["path"]) for a in result["artifacts"] if a["name"]=="交付检查报告")
+            assert json.loads(report.read_text(encoding="utf-8"))["decode"]=="passed"
         asyncio.run(run())

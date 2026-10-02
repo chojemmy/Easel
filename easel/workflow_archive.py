@@ -282,6 +282,12 @@ def preview_archive(project: dict, vault: Path, project_root: Path) -> dict:
             platform_status = "已发布" if status in {"已发布", "部分已发布"} and platform in verified_platforms else "已存草稿" if status == "已存草稿" and platform in verified_platforms else "待发布"
             lines.append(f"| {platform.replace('|', '／')} | {platform_status} |")
         lines.append("")
+    revision = next((node.get("render_receipt") for stage in ("deliver", "review")
+                     for node in project.get("nodes", []) if node["id"] == stage and
+                     node.get("status") in {"completed", "awaiting_review"} and node.get("render_receipt")), None)
+    if revision:
+        from .workflow_render_settings import production_notes
+        lines += [production_notes(revision).replace("# 本版制作要求", "## 本版制作要求", 1), ""]
     lines += ["## 存档说明", "", f"主稿：{_text(manuscript.get('title') or title, single_line=True)}（版本 {_text(manuscript.get('version', 1), single_line=True)}）。", "", "原稿和原始素材保留原位；本页媒体链接指向现有文件。", ""]
     if status not in {"已发布", "部分已发布"}:
         lines += ["归档不代表公开发布；实际发布结果核实后再更新状态。", ""]

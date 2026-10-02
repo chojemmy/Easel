@@ -22,7 +22,9 @@ def render_case(tmp_path, monkeypatch):
     source.write_bytes(b"unchanged source audio and video")
     props = {"source": source.name, "source_sha256": module.file_sha256(source),
              "duration": 20, "fps": 30, "width": 1080, "height": 1920,
-             "visual": {"accent": "#2F6FED"}, "captions": [{"text": "原字幕", "startMs": 0, "endMs": 2000}],
+             "visual": {"background":"#0A1626", "accent": "#2F6FED", "textColor":"#E8F0FF",
+                        "subtitleSize":48,"cardPosition":"left","titleCase":"bold","template":"documentary"},
+             "captions": [{"text": "原字幕", "startMs": 0, "endMs": 2000}],
              "scenes": [{"start": 0, "end": 10, "card": ""}, {"start": 10, "end": 20, "card": "已确认的卡片"}]}
     module.write_json(work / "props.json", props)
     module.write_json(work / "template-ownership.json", {

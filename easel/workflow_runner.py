@@ -27,6 +27,7 @@ from typing import Callable
 
 from .workflow_agent_context import project_memory
 from .workflow_captions import CaptionPlanError, align_caption_lines, clean_caption_text, spoken_text, timed_words, validate_caption_plan, to_srt
+from .workflow_render_revision import prepare_revision, revision_documents, approved_revision
 
 
 class RunnerBlocked(ValueError):
@@ -275,7 +276,7 @@ class _Run:
                 if kind not in {"status", "generation", "tool", "result"}:
                     raise ValueError("未知进度事件类型")
                 event = {"kind": kind, "text": clean_log(str(text.get("text", "")))}
-                if text.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating"}:
+                if text.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating", "rendering", "inspecting"}:
                     event["phase"] = text["phase"]
                 self.progress(event)
             else:
@@ -289,7 +290,9 @@ class _Run:
         path = path.resolve()
         if self.directory not in path.parents or not path.is_file() or path.stat().st_size == 0:
             raise RunnerBlocked("节点产物不存在、为空或不在工作流目录内。")
-        return {"name": name or path.name, "path": str(path), "kind": kind}
+        version = next((n.get("version", 0) for n in self.project.get("nodes", []) if n["id"] == self.node), 0)
+        return {"name": name or path.name, "path": str(path), "kind": kind,
+                "sha256": file_sha256(path), "version": version, "run_id": self.options.get("run_id", "")}
 
     def file_setting(self, key, required=True):
         value = self.options.get(key) or (self.project.get("media") or {}).get(key) or (self.project.get("settings") or {}).get(key)
@@ -431,7 +434,7 @@ class _Run:
     async def model(self, prompt, *, output_format="text"):
         self.notify("项目 Agent 正在按本节点 Skill 生成本轮产物…")
         feedback = self.options.get("feedback") or self.options.get("notes")
-        if feedback and str(feedback) not in prompt:
+        if feedback and str(feedback) not in prompt and not self.options.get("render_requests"):
             prompt += f"\n本次修改意见（仅在本节点支持范围内执行）：{feedback}"
         system = "你是文本/JSON编写器，没有工具，不能读取文件或运行命令。Skill中的执行性条款由宿主程序处理；本请求只输出用户prompt指定的文本或JSON产物，不讨论或模拟执行过程。下面保留全部Skill，供内容与偏好遵循：\n\n" + str(self.skill.get("content") or "按输入要求输出，不执行外部动作。")
         if self.library_guidance:
@@ -529,6 +532,7 @@ class _Run:
                 defaults.update(background="#E9E4DB",accent="#768275",textColor="#172120")
             return validate_visual(defaults,template), "default"
         prompt = f"为固定口播模板选择视觉参数，返回JSON：background/accent/textColor为六位HEX颜色，subtitleSize数值36–72（1080p基准），cardPosition为left或right，titleCase为normal或bold；另可含unsupported_requests简短字符串数组。模板固有功能：持续原片A-roll和原声、真实时间戳字幕、少量章节卡；竖屏章节卡已放下方安全区避免遮脸，横屏左右位置由cardPosition选择；字幕已固定为安全底部白字+黑色半透明底，显示文本每行最多18字符，典型两行，超过36字符会保留多行并适当缩小字号，不改变时间轴。textColor只影响卡片文字等非字幕文字。以上内置行为无需列入unsupported_requests。可配置色彩、字号、横屏卡片位置和字重；不支持新布局、B-roll插入、3D、自动粗剪、时间戳重分段、额外特效或音乐。如果用户或Skill要求超出这些能力，必须如实列入unsupported_requests，不能声称已实现。不要输出代码。依据当前Skill、内容与用户风格决定参数，保持可读。模板：{template}；内容：{self.project.get('title')}；视觉要求：{settings.get('visual_style','克制科技纪录片')}；字幕要求：{settings.get('subtitle_style','清晰易读')}。"
+        prompt += "\n音乐、视频倍速和字幕上下位置由样片执行器的 render_preferences 实现，本请求只选择上述六个基础视觉字段；这些已支持要求不列为未实现。"
         if explicit is not None:
             prompt += "\n以下显式参数是修改前参考基线，不能覆盖本次修改意见；只调整意见涉及的参数，其余尽量保持：" + json.dumps({key:value for key,value in explicit.items() if key not in {"template","unsupported_requests"}},ensure_ascii=False)
         return await self.model_json(prompt, validator=lambda value: validate_visual(value, template)), "model"
@@ -563,6 +567,8 @@ class _Run:
             "publish": ("skill-cross-platform-publish",),
             "archive": ("skill-publish-log", "skill-content-postmortem"),
         }
+        if self.node in {"build", "review", "deliver"}:
+            routes[self.node] += ("audio-mix",)
         if self.node == "publish" and self.project.get("kind") != "article":
             platform = (self.project.get("settings") or {}).get("publish_platform") or "weixin-channels"
             adapter = {"weixin-channels": "skill-channels-upload", "kuaishou": "skill-kuaishou-upload"}.get(platform)
@@ -1092,7 +1098,7 @@ class _Run:
             message, finished = parsed
             current = time.monotonic()
             if message != last_message and (finished or current - last_update >= 1):
-                self.notify({"kind": "status", "text": f"{label}：{message}"})
+                self.notify({"kind": "status", "phase": "rendering", "text": f"{label}：{message}"})
                 last_update, last_message = current, message
 
         return await self.command([shutil.which("node") or "node", cli, command, "src/index.ts", *args, "--browser-executable", self.browser()], cwd=self.work, timeout=timeout, label=label, on_output=on_output)
@@ -1192,11 +1198,18 @@ class _Run:
             message += f" {len(long_caption_indices)} 条字幕超过两行，保留完整文字并缩小显示；请在样片中校对，必要时人工拆段。"
         return {"status":"completed", "message":message, "artifacts":[self.artifact(props_path,"模板参数"),self.artifact(report,"构建检查报告"),self.artifact(self.work / "src/Root.tsx","可复用源码")]}
 
-    async def step_review(self):
-        props = read_json(self.work / "props.json")
-        if props.get("source_sha256") != await asyncio.to_thread(file_sha256,self.work/"public"/props["source"]):
-            raise RunnerBlocked("模板原片已改变，请重新检查素材并构建。")
+    async def step_review(self, *, prepared=None):
+        # Prepare once from the original clock. Each preview owns its props,
+        # requirements and media; a failed render cannot replace a good version.
+        if prepared is None:
+            review_dir = self.artifacts / "review" / f"run-{uuid.uuid4().hex[:12]}"
+            review_dir.mkdir(parents=True, exist_ok=False)
+            props, props_path, receipt = await prepare_revision(self, review_dir)
+        else:
+            props, props_path, receipt = prepared
+            review_dir = props_path.parent
         self.sync_template_sources(require_existing=True)
+        receipt["template_sha256"] = file_sha256(self.work / "src/Root.tsx")
         total = max(1, math.ceil(props["duration"] * 30))
         # Include a non-opening chapter boundary when possible.
         starts = [int(scene["start"]*30) for scene in props["scenes"] if scene.get("card") and scene["start"] > 0]
@@ -1204,47 +1217,75 @@ class _Run:
         end = min(total-1, start+min(360,total)-1)
         # Unique outputs prevent a prior successful/partial render from masking
         # a missing file in this run, and leave earlier human-review media intact.
-        review_dir = self.artifacts / "review" / f"run-{uuid.uuid4().hex[:12]}"
-        review_dir.mkdir(parents=True, exist_ok=False)
         preview = review_dir / "preview.mp4"
-        await self.remotion("render", "WorkflowVideo", preview, "--props", self.work / "props.json", "--frames", f"{start}-{end}", "--scale", "0.5", "--crf", "30", "--concurrency", "2", progress_label="渲染样片")
+        await self.remotion("render", "WorkflowVideo", preview, "--props", props_path, "--frames", f"{start}-{end}", "--scale", "0.5", "--crf", "30", "--concurrency", "2", progress_label="渲染样片")
         metadata = await self.probe(preview)
         expected_duration = (end-start+1)/30
         if abs(metadata["duration"] - expected_duration) > .15:
             raise RunnerBlocked("样片时长与请求的原片范围不符，请查看运行日志。")
+        self.notify({"kind": "status", "phase": "inspecting", "text": "新样片已生成，正在完整解码并检查字幕/章节边界。"})
         await self.command(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", preview, "-f", "null", "-"], timeout=900, label="完整解码样片并检查音视频")
         frame_set = {0, total-1}
         for scene in props["scenes"]:
             first, last = round(scene["start"]*30), round(scene["end"]*30)
             frame_set.update(frame for frame in (first-1,first,first+1,last-1) if 0 <= frame < total)
         frame_dir = review_dir / "frames"
-        await self.remotion("render", "WorkflowVideo", frame_dir, "--props", self.work / "props.json", "--frames", ",".join(str(frame) for frame in sorted(frame_set)), "--sequence", "--image-format", "png", "--image-sequence-pattern", "frame-[frame].[ext]", "--muted", "--scale", "0.5", "--concurrency", "2", timeout=900, progress_label="检查章节边界")
+        await self.remotion("render", "WorkflowVideo", frame_dir, "--props", props_path, "--frames", ",".join(str(frame) for frame in sorted(frame_set)), "--sequence", "--image-format", "png", "--image-sequence-pattern", "frame-[frame].[ext]", "--muted", "--scale", "0.5", "--concurrency", "2", timeout=900, progress_label="检查章节边界")
         pad = len(str(max(frame_set)))
         frames = [self.artifact(frame_dir / f"frame-{frame:0{pad}d}.png", f"边界帧 {frame}", "inspection_frame") for frame in sorted(frame_set)]
-        report = write_json(review_dir / "review-report.json", {"preview_seconds":expected_duration,"source_range_seconds":[start/30,(end+1)/30],"boundary_frames":sorted(frame_set),"decoder":"offthread_ffmpeg","metadata":metadata,"decode":"passed","human_visual_review":"pending","timeline_mode":"original_no_cuts","checks":["字幕首中尾及章节边界同步","卡片不遮挡面部和原有字幕","文字在手机尺寸清晰可读"]})
-        return {"message":"样片与章节边界静帧已生成，等待你观看确认；自动检查不代替视觉验收。", "artifacts":[self.artifact(preview,"低清样片","preview_video"),*frames,self.artifact(report,"样片检查报告")]}
+        rate = receipt["preferences"]["playback_rate"]
+        report = write_json(review_dir / "review-report.json", {"preview_seconds":expected_duration,"output_range_seconds":[start/30,(end+1)/30],"source_range_seconds":[start/30*rate,(end+1)/30*rate],"boundary_frames":sorted(frame_set),"decoder":"offthread_ffmpeg","metadata":metadata,"decode":"passed","human_visual_review":"pending","timeline_mode":"source_clock_mapped_no_cuts", "render_receipt":receipt,"checks":["字幕首中尾及章节边界同步","卡片不遮挡面部和原有字幕","文字在手机尺寸清晰可读","人声与背景音乐平衡"]})
+        documents = revision_documents(self, review_dir, receipt)
+        prefs = receipt["preferences"]
+        artifacts = [self.artifact(preview,"低清样片","preview_video"),*frames,self.artifact(report,"样片检查报告"),*documents]
+        for artifact in artifacts:
+            artifact["version"] = receipt["version"]
+        return {"message":f"新样片 v{receipt['version']} 已生成：字幕 {prefs['subtitle_size']:g}px / 距底部 {prefs['subtitle_bottom']:.0%} / {rate:g} 倍速 / {'背景音乐 ' + str(round(prefs['bgm_volume']*100)) + '%' if receipt['music'] else '无配乐'}。等待你观看确认。",
+                "artifacts":artifacts,
+                "render_receipt":receipt,"settings":{**self.project.get("settings", {}),"render_preferences":copy.deepcopy(prefs)}}
 
     async def step_deliver(self):
         explicit_import = self.options.get("action") == "import" or self.options.get("import_final") is True
         imported = self.file_setting("final_path") if explicit_import else None
-        final = self.artifacts / "final.mp4"
+        delivery_requests = []
+        if not imported and (self.options.get("render_requests") or self.options.get("feedback")):
+            candidate_dir = self.artifacts / "review" / f"run-{uuid.uuid4().hex[:12]}"
+            candidate_dir.mkdir(parents=True, exist_ok=False)
+            prepared = await prepare_revision(self, candidate_dir)
+            candidate = prepared[2]
+            review = next((n for n in self.project.get("nodes", []) if n["id"] == "review"), {})
+            previous = review.get("render_receipt", {})
+            same = all(candidate.get(key) == previous.get(key) for key in ("preferences", "base_props_sha256", "source_sha256", "music"))
+            if not same or review.get("status") != "completed":
+                preview = await self.step_review(prepared=prepared)
+                return {"status":"blocked", "message":"新的制作要求已生成样片，已更新“预览与质检”；请确认该版本后再导出全片。",
+                        "artifacts":[], "preview_revision":preview, "settings":preview["settings"]}
+            delivery_requests = candidate["requests"]
+        delivery_dir = self.artifacts / "deliver" / f"run-{uuid.uuid4().hex[:12]}"
+        delivery_dir.mkdir(parents=True, exist_ok=False)
+        final = delivery_dir / "final.mp4"
         if imported:
             if imported != final.resolve():
                 await asyncio.to_thread(shutil.copy2, imported, final)
             origin = "imported_existing_final"
         else:
-            props = read_json(self.work / "props.json")
-            if props.get("source_sha256") != await asyncio.to_thread(file_sha256,self.work/"public"/props["source"]):
-                raise RunnerBlocked("模板原片已改变，请重新检查素材并构建。")
+            props, props_path, receipt = await asyncio.to_thread(approved_revision, self)
+            receipt["requests"] = receipt.get("requests", []) + delivery_requests
             self.sync_template_sources(require_existing=True)
-            await self.remotion("render", "WorkflowVideo", final, "--props", self.work / "props.json", "--codec", "h264", "--crf", "18", "--concurrency", "2")
+            await self.remotion("render", "WorkflowVideo", final, "--props", props_path, "--codec", "h264", "--crf", "18", "--concurrency", "2", progress_label="渲染已确认版本的全片")
             origin = "rendered_template"
         metadata = await self.probe(final)
+        if not imported and abs(metadata["duration"] - props["duration"]) > .15:
+            raise RunnerBlocked("成片真实时长与已确认版本不符，请查看日志。")
         await self.command(["ffmpeg","-v","error","-i",final,"-f","null","-"],timeout=7200,label="完整解码成片检查")
-        cover = self.artifacts / "cover.jpg"
+        cover = delivery_dir / "cover.jpg"
         await self.command(["ffmpeg","-y","-v","error","-ss",str(min(2,metadata['duration']/2)),"-i",final,"-frames:v","1",cover],label="提取成片封面")
-        report = write_json(self.artifacts / "delivery-report.json", {**metadata,"origin":origin,"decode":"passed","timeline_mode":"original_no_cuts" if not imported else "imported_timeline_not_modified","visual_review":"requires_user"})
-        return {"message":"成片已完成音视频轨与完整解码检查，封面已提取。" + ("本次为导入已有成片。" if imported else ""),"artifacts":[self.artifact(final,"最终视频","final_video"),self.artifact(cover,"封面","cover"),self.artifact(report,"交付检查报告")],"media":{**(self.project.get('media') or {}),"final_path":str(final),"cover_path":str(cover)}}
+        report = write_json(delivery_dir / "delivery-report.json", {**metadata,"origin":origin,"decode":"passed","timeline_mode":"source_clock_mapped_no_cuts" if not imported else "imported_timeline_not_modified","visual_review":"requires_user", "render_receipt":receipt if not imported else None})
+        result = {"message":"成片已完成音视频轨与完整解码检查，封面已提取。" + ("本次为导入已有成片。" if imported else f"使用已确认样片 v{receipt['version']} 的同一份制作参数。"),"artifacts":[self.artifact(final,"最终视频","final_video"),self.artifact(cover,"封面","cover"),self.artifact(report,"交付检查报告")],"media":{**(self.project.get('media') or {}),"final_path":str(final),"cover_path":str(cover)}}
+        if not imported:
+            result["render_receipt"] = receipt
+            result["artifacts"] += revision_documents(self, delivery_dir, receipt)
+        return result
 
     async def step_publish(self):
         settings = self.project.get("settings") or {}
@@ -1265,11 +1306,13 @@ class _Run:
             article.write_text(str(primary["content"]),encoding="utf-8")
             package = write_json(self.artifacts / "publication-package.json", {"kind":"article","title":settings.get("publish_title") or self.project.get("title"),"article_path":str(article),"content_version":self.project.get("content_version"),"status":"local_package_only"})
             return {"status":"completed","message":"本地文章发布包已准备，未提交任何平台；可继续归档。","artifacts":[self.artifact(article,"待发布文章"),self.artifact(package,"文章发布包")]}
-        final = self.artifacts / "final.mp4"
+        final = Path((self.project.get("media") or {}).get("final_path") or self.artifacts / "final.mp4").resolve()
+        if not final.is_relative_to(self.directory):
+            raise RunnerBlocked("发布文件不在工作流产物目录内，请重新导入并检查。")
         if not final.is_file():
             raise RunnerBlocked("请先生成或导入并验证最终视频。")
         await self.probe(final)
-        payload = {"platform":platform,"title":settings.get("publish_title") or self.project.get("title"),"description":settings.get("publish_description", ""),"tags":settings.get("publish_tags", ""),"media":str(final),"cover":str(self.artifacts / "cover.jpg"),"content_version":self.project.get("content_version")}
+        payload = {"platform":platform,"title":settings.get("publish_title") or self.project.get("title"),"description":settings.get("publish_description", ""),"tags":settings.get("publish_tags", ""),"media":str(final),"cover":str((self.project.get("media") or {}).get("cover_path") or self.artifacts / "cover.jpg"),"content_version":self.project.get("content_version")}
         media_hash = await asyncio.to_thread(file_sha256, final)
         cover_hash = await asyncio.to_thread(file_sha256, Path(payload['cover'])) if Path(payload['cover']).is_file() else None
         content_hash = hashlib.sha256(json.dumps({"media_sha256":media_hash,"cover_sha256":cover_hash,"platform":platform,"action":action,"title":payload['title'],"description":payload['description'],"tags":payload['tags']},ensure_ascii=False,sort_keys=True).encode("utf-8")).hexdigest()

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .workflow_render_settings import RENDER_NODES, pending_render_requests, validate_preferences
+
 
 NODE_DEFINITIONS = [
     {"id": "brief", "title": "需求与材料", "phase": "策划", "description": "确定主题、受众、目标与参考材料。"},
@@ -220,6 +222,9 @@ class ContentWorkflowService:
                     value = normalized
                 if key == "settings" and "subtitle_max_chars" in value and (type(value["subtitle_max_chars"]) is not int or not 8 <= value["subtitle_max_chars"] <= 40):
                     raise ValueError("每条字幕字数请设置为 8–40，默认 12 字。")
+                if key == "settings" and "render_preferences" in value:
+                    value["render_preferences"] = validate_preferences({**p.get("settings", {}).get("render_preferences", {}),
+                        **validate_preferences(value["render_preferences"])})
                 if value == p.get(key):
                     continue
                 start = {"title": "brief", "brief": "brief", "manuscripts": "script", "primary_manuscript_id": "script", "media": "source", "settings": "storyboard"}[key]
@@ -243,6 +248,11 @@ class ContentWorkflowService:
                         # A form sends existing settings back; stale explicit props
                         # must not silently override a newly entered style request.
                         value.pop("visual_parameters", None)
+                    if changed & {"visual_style", "template"} and "render_preferences" not in changed:
+                        for field in ("background", "accent", "text_color", "card_position", "title_case"):
+                            value.get("render_preferences", {}).pop(field, None)
+                    if "subtitle_style" in changed and "render_preferences" not in changed:
+                        value.get("render_preferences", {}).pop("subtitle_size", None)
                     if "subtitle_max_chars" in changed:
                         start = "transcript"
                     elif changed <= {"archive_folder", "media_root"}:
@@ -251,6 +261,8 @@ class ContentWorkflowService:
                         start = "publish"
                     elif changed <= {"final_path", "cover_path"}:
                         start = "deliver"
+                    elif changed <= {"render_preferences"}:
+                        start = "review"
                     elif changed <= {"output_ratio", "template", "visual_style", "subtitle_style", "visual_parameters"}:
                         start = "build"
                 earliest = min(earliest, NODE_IDS.index(start))
@@ -310,6 +322,8 @@ class ContentWorkflowService:
             p = self.get(project_id)
             self._idle(p)
             n = node_of(p, node)
+            if node in RENDER_NODES:
+                options["render_requests"] = pending_render_requests(p)
             if chat_turn_id is not None and (n.get("chat", {}).get("turn_id") != chat_turn_id or
                     not any(m.get("id") == chat_turn_id and m.get("role") == "assistant" for m in n["chat"].get("messages", []))):
                 raise WorkflowConflict("对话已更新，未启动旧回复提出的任务。")
@@ -317,7 +331,11 @@ class ContentWorkflowService:
                 raise ValueError("文章工作流跳过视频节点")
             if node == "archive":
                 raise ValueError("请先预览归档，再确认存档")
-            self.prerequisites(p, node)
+            if node == "deliver" and options.get("render_requests"):
+                # New edits need a preview, even when a prior version was approved.
+                self.prerequisites(p, "review")
+            else:
+                self.prerequisites(p, node)
             action = options.get("action", "run")
             if node == "publish" and n.get("publication_uncertain") and action != "verify":
                 raise WorkflowConflict("上次提交结果不明。请先到平台核对，不能自动重发。")
@@ -331,6 +349,8 @@ class ContentWorkflowService:
             n.update(status="running", phase="preparing", message="准备执行…", version=n["version"] + 1, skill_version=skill["version"])
             run = {"id": "run-" + uuid.uuid4().hex[:12], "started_at": now(), "status": "running",
                    "action": action, "content_version": p["content_version"], "skill_version": skill["version"]}
+            if node in RENDER_NODES:
+                run["render_request_ids"] = [item["id"] for item in options["render_requests"]]
             n["runs"].append(run)
             if chat_turn_id is not None:
                 run["chat_turn_id"] = chat_turn_id
@@ -395,7 +415,7 @@ class ContentWorkflowService:
                     n["message"] = safe_error(message)
                 elif message.get("kind") != "generation":
                     n["message"] = safe_error(message.get("text", ""))
-                if isinstance(message, dict) and message.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating"}:
+                if isinstance(message, dict) and message.get("phase") in {"preparing", "transcribing", "correcting", "segmenting", "validating", "rendering", "inspecting"}:
                     n["phase"] = message["phase"]
                 n["runs"][-1]["message"] = n["message"]
                 self._sync_chat_execution(n, n["runs"][-1])
@@ -420,8 +440,37 @@ class ContentWorkflowService:
                         p[key] = result[key]
                 if inputs_changed:
                     p["content_version"] += 1
-                n.update(status=result.get("status", "awaiting_review"), message=result.get("message", "已生成，等待确认"),
-                         artifacts=result.get("artifacts", []))
+                status = result.get("status", "awaiting_review")
+                artifacts = result.get("artifacts", [])
+                if node in RENDER_NODES and status in {"blocked", "failed"}:
+                    old = [a for a in n.get("artifacts", []) if a.get("kind") not in {"log"} and a.get("name") != "本次执行 Skill"]
+                    artifacts = old + artifacts
+                n.update(status=status, message=result.get("message", "已生成，等待确认"), artifacts=artifacts)
+                receipt = result.get("render_receipt") if status in {"completed", "awaiting_review"} else None
+                if node == "deliver" and isinstance(result.get("preview_revision"), dict):
+                    preview = result["preview_revision"]
+                    receipt = preview["render_receipt"]
+                    review = node_of(p, "review")
+                    review.update(status="awaiting_review", phase="finished", version=receipt["version"],
+                        message=preview["message"], artifacts=preview["artifacts"], render_receipt=receipt,
+                        library_skills_used=result.get("library_skills_used", []))
+                    review.pop("approved_version", None)
+                    review["runs"].append({"id":run_id,"started_at":n["runs"][-1]["started_at"],
+                        "finished_at":now(),"status":"awaiting_review","message":preview["message"],
+                        "render_receipt":receipt,"from_node":"deliver"})
+                    self.activity(p, "review", {"kind":"result","text":preview["message"]}, run_id)
+                if receipt:
+                    n["runs"][-1]["render_receipt"] = receipt
+                    if node != "deliver" or "preview_revision" not in result:
+                        n["render_receipt"] = receipt
+                    ids = {item["id"] for item in receipt.get("requests", [])}
+                    for target in p["nodes"]:
+                        for message in target.get("chat", {}).get("messages", []):
+                            if message.get("id") in ids:
+                                message["applied_render_run_id"] = run_id
+                        for index, feedback in enumerate(target.get("feedback", [])):
+                            if f"feedback:{target['id']}:{index}" in ids:
+                                feedback["applied_run_id"] = run_id
                 if isinstance(result.get("library_skills_used"), list):
                     n["library_skills_used"] = result["library_skills_used"]
                     n["runs"][-1]["library_skills_used"] = result["library_skills_used"]
@@ -431,7 +480,7 @@ class ContentWorkflowService:
                 n["phase"] = "finished"
                 self._sync_chat_execution(n, n["runs"][-1])
                 self.activity(p, node, {"kind": "error" if n["status"] in {"blocked", "failed"} else "result", "text": n["message"]}, run_id)
-                if n["status"] in ("completed", "awaiting_review"):
+                if node not in RENDER_NODES and n["status"] in ("completed", "awaiting_review"):
                     for feedback in n["feedback"]:
                         if not feedback.get("applied_run_id"):
                             feedback["applied_run_id"] = run_id

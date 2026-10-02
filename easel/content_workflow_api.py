@@ -48,7 +48,9 @@ def router(service: ContentWorkflowService) -> APIRouter:
                 path = path.resolve()
                 if path.is_relative_to(directory) and path.is_file():
                     rel = path.relative_to(directory).as_posix()
-                    artifact["url"] = f"/api/content-workflows/{p['id']}/artifacts?path={quote(rel, safe='')}"
+                    stat = path.stat()
+                    revision = f"{artifact.get('sha256', '')}-{stat.st_mtime_ns}-{stat.st_size}"
+                    artifact["url"] = f"/api/content-workflows/{p['id']}/artifacts?path={quote(rel, safe='')}&revision={quote(str(revision), safe='')}"
         return p
 
     @api.get("")
@@ -288,7 +290,7 @@ def router(service: ContentWorkflowService) -> APIRouter:
             media = {".mp4": "video/mp4", ".webm": "video/webm", ".png": "image/png", ".jpg": "image/jpeg",
                      ".jpeg": "image/jpeg", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".json": "application/json"}
             return FileResponse(file, media_type=media.get(file.suffix.lower(), "text/plain; charset=utf-8"),
-                                headers={"X-Content-Type-Options": "nosniff"})
+                                headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"})
         except (ValueError, OSError) as exc:
             fail(exc)
 
