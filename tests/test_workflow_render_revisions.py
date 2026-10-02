@@ -180,6 +180,29 @@ def test_mixer_new_music_fades_preserve_the_last_voice_samples(tmp_path):
     assert np.std(mixed-source)>0
 
 
+def test_mixer_calibrates_loud_music_against_a_quiet_recording(tmp_path):
+    import shutil, subprocess, sys, wave
+    import numpy as np
+    if not shutil.which('ffmpeg'):pytest.skip('requires installed ffmpeg')
+    voice=tmp_path/'quiet-voice.wav';bgm=tmp_path/'loud-bgm.wav';output=tmp_path/'mixed.wav'
+    for path,frequency,volume in ((voice,300,.02),(bgm,1000,1)):
+        subprocess.run(['ffmpeg','-nostdin','-y','-v','error','-f','lavfi','-i',f'sine=frequency={frequency}:sample_rate=44100:duration=4,volume={volume}',str(path)],check=True)
+    script=Path(__file__).resolve().parents[1]/'skills/shared/scripts/audio_mix.py'
+    result=subprocess.run([sys.executable,str(script),'mix','--voice',str(voice),'--bgm',str(bgm),'--bgm-volume','.1',
+        '--bgm-relative-to-voice','--bgm-fade-in','1','--bgm-fade-out','1','--master-fade-out','0','--bgm-loop-off','-o',str(output)],check=True,capture_output=True)
+    line=next(line for line in result.stdout.decode('utf-8',errors='replace').splitlines() if line.startswith('BGM_CALIBRATION '))
+    calibration=json.loads(line.removeprefix('BGM_CALIBRATION '))
+    assert 0<calibration['effective_bgm_volume']<.005
+    assert calibration['duck_threshold']<.03
+    def samples(path):
+        with wave.open(str(path),'rb') as audio:
+            return np.frombuffer(audio.readframes(audio.getnframes()),dtype=np.int16).astype(float)
+    source,mixed=samples(voice),samples(output)
+    music=mixed-source
+    assert np.sqrt(np.mean(music**2))/np.sqrt(np.mean(source**2))<=.11
+    assert np.corrcoef(source,mixed)[0,1]>.99
+
+
 def test_render_preferences_only_invalidate_review_and_merge_partial_changes(tmp_path):
     service=ContentWorkflowService(tmp_path/'repo',vault=tmp_path/'vault')
     p=service.create({'title':'字幕更大','settings':{'render_preferences':{'playback_rate':1.1,'bgm_enabled':True}}})

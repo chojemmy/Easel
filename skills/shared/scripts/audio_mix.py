@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -77,6 +79,16 @@ def _done(out: Path, extra: str = "") -> None:
     print(f"OK {out} ({kb:.0f} KB){(' ' + extra) if extra else ''}")
 
 
+def _mean_db(path: Path, duration: float) -> float:
+    proc = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-i", str(path), "-t", str(duration),
+        "-af", "volumedetect", "-f", "null", "-"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace")
+    match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", proc.stderr or "")
+    if proc.returncode or not match or float(match[1]) <= -90:
+        _die("人声或配乐近乎无声/音量测量失败，不能可靠校准背景音乐", 2)
+    return float(match[1])
+
+
 def cmd_mix(a) -> int:
     _check_ffmpeg()
     for field in ("bgm_fade_in", "bgm_fade_out", "master_fade_out"):
@@ -105,6 +117,19 @@ def cmd_mix(a) -> int:
     target = a.duration if a.duration else (max(ends) if ends else 0.0)
     if target <= 0:
         _die("无法确定输出时长，请用 --duration 指定。", 2)
+    bgm_volume, duck_threshold = a.bgm_volume, 0.03
+    calibration = None
+    if getattr(a, "bgm_relative_to_voice", False):
+        if not a.voice or not a.bgm:
+            _die("相对人声音量校准需要同时提供 voice 和 bgm", 2)
+        voice_db = _mean_db(_require(a.voice), target)
+        music_db = _mean_db(_require(a.bgm), target)
+        bgm_volume *= min(1.0, 10 ** ((voice_db - music_db) / 20))
+        duck_threshold = max(.001, min(.03, 10 ** (voice_db / 20) * .5))
+        calibration = {"voice_mean_db": voice_db, "music_mean_db": music_db,
+            "requested_volume": a.bgm_volume, "effective_bgm_volume": bgm_volume,
+            "target_music_to_voice_db": 20 * math.log10(a.bgm_volume) if a.bgm_volume > 0 else None,
+            "duck_threshold": duck_threshold}
 
     inputs: list[str] = []
     filt: list[str] = []
@@ -122,7 +147,7 @@ def cmd_mix(a) -> int:
         # 循环补足 + 音量；如需 ducking，用旁白做 sidechain 压 BGM
         loop_args = [] if a.bgm_loop_off else ["-stream_loop", "-1"]
         inputs += [*loop_args, "-i", str(_require(a.bgm))]
-        filt.append(f"[{idx}:a]volume={a.bgm_volume},aresample=44100[bgm0]")
+        filt.append(f"[{idx}:a]volume={bgm_volume},aresample=44100[bgm0]")
         fade_in = getattr(a, "bgm_fade_in", 0.0)
         fade_out = getattr(a, "bgm_fade_out", 0.0)
         fades = []
@@ -139,7 +164,7 @@ def cmd_mix(a) -> int:
             filt.append(f"{voice_label}asplit=2[voice_m][voice_sc]")
             voice_label = "[voice_m]"
             filt.append("[bgm0][voice_sc]sidechaincompress="
-                        "threshold=0.03:ratio=8:attack=20:release=300[bgm]")
+                        f"threshold={duck_threshold}:ratio=8:attack=20:release=300[bgm]")
         else:
             filt.append("[bgm0]anull[bgm]")
         mix_labels.append("[bgm]")
@@ -175,6 +200,8 @@ def cmd_mix(a) -> int:
           "-map", "[out]", "-t", f"{target:.3f}", str(out)])
     duck = "闪避" if (a.voice and a.bgm and not a.no_duck) else "无闪避"
     _done(out, f"({len(mix_labels)} 轨 / {target:.1f}s / {duck})")
+    if calibration is not None:
+        print("BGM_CALIBRATION " + json.dumps(calibration, ensure_ascii=True))
     return 0
 
 
@@ -227,6 +254,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("mix", help="多轨混音")
+    p.add_argument("--bgm-relative-to-voice", action="store_true", help="按实际人声音量校准 BGM，轻声录音也不会被音乐盖过")
     p.add_argument("--bgm-fade-in", type=float, default=0.0, help="仅音乐淡入秒数（默认 0）")
     p.add_argument("--bgm-fade-out", type=float, default=0.0, help="仅音乐淡出秒数（默认 0）")
     p.add_argument("--master-fade-out", type=float, default=1.5, help="混音总轨淡出秒数；设 0 保留最后的人声")

@@ -115,10 +115,10 @@ def production_notes(receipt: dict) -> str:
         f"- 全片预计时长：{receipt['duration_seconds']:.2f} 秒",
         f"- 背景音乐：{music['title'] if music else '关闭'}"]
     if music:
-        lines += [f"- 音乐音量：{prefs['bgm_volume']:.0%}；淡入 {prefs['bgm_fade_in']:g}s / 淡出 {prefs['bgm_fade_out']:g}s",
+        lines += [f"- 音乐相对人声音量：{prefs['bgm_volume']:.0%} 以内，按本片实际人声校准并自动闪避；淡入 {prefs['bgm_fade_in']:g}s / 淡出 {prefs['bgm_fade_out']:g}s",
                   f"- 音乐来源：{music.get('source_site', '')}", f"- 授权记录：{music.get('license', '')}"]
-    lines += ["", "## 本轮原始要求", ""]
-    lines += [f"- {item['text']}" for item in receipt.get("requests", [])]
+    lines += ["", "## 本版累计要求", ""]
+    lines += [f"- {item['text']}" for item in receipt.get("requirements", receipt.get("requests", []))]
     lines += ["", "## 复用和技能沉淀", "", "使用本版制作参数新建项目，可继续在节点对话中修改；原片、稿件和发布文案不会带到新项目。",
               "通用做法可在节点的「沉淀到实际 Skill」中预览修改，再确认写入来源 Skill。样片仍需人工确认。", ""]
     return "\n".join(lines)

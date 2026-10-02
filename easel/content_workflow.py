@@ -346,6 +346,10 @@ class ContentWorkflowService:
                 p["content_version"] += 1
             self.invalidate(p, node, "当前节点重新运行，下游需要重新检查。")
             skill = self.skills.get(node)
+            for artifact in n.get("artifacts", []):
+                # Older projects did not record a media version. Bind them
+                # before increasing the node version or showing a new run.
+                artifact.setdefault("version", n["version"])
             n.update(status="running", phase="preparing", message="准备执行…", version=n["version"] + 1, skill_version=skill["version"])
             run = {"id": "run-" + uuid.uuid4().hex[:12], "started_at": now(), "status": "running",
                    "action": action, "content_version": p["content_version"], "skill_version": skill["version"]}

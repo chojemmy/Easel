@@ -49,6 +49,11 @@ python skills/shared/scripts/audio_mix.py mix --voice v.mp3 \
 ## 调参
 
 - **人声被音乐盖住**：调低 `--bgm-volume`（默认 0.25）或确认闪避已开（默认开）。
+- **原人声偏轻时优先用** `--bgm-relative-to-voice`：按实际人声和配乐 RMS 校准，
+  `--bgm-volume 0.1` 代表配乐不高于人声 RMS 的 10%，并调整闪避阈值；不能仅凭 10% 的原曲增益判断音乐够轻。
+  执行输出 `BGM_CALIBRATION` 保存测量值、实际增益和闪避阈值，弱模型无需猜测。
+- **只淡出音乐、保留最后一句口播**：`--bgm-fade-in 1 --bgm-fade-out 2 --master-fade-out 0`。
+  原默认总轨末尾淡出仍保留兼容；工作流应显式选择只淡出配乐。
 - **闪避太猛/音乐一顿一顿**：`--no-duck` 后手动压低 `--bgm-volume`。
 - **BGM 比旁白短**：默认自动循环；不想循环用 `--bgm-loop-off`。
 - **音效太响/太轻**：`--sfx-volume`（默认 0.9）。

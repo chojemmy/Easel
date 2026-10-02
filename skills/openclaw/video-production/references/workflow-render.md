@@ -49,7 +49,9 @@
   每轮从原始时间轴生成独立 `render-props.json`，不能反复对上一版时间乘除造成漂移。
 - 背景音乐先读原 `audio-mix` Skill，使用本地登记且校验和/授权记录一致的安静曲目，
   检查实际音轨和时长；调用原 `skills/shared/scripts/audio_mix.py mix`，默认人声优先闪避、音乐音量 .10，
-  `--bgm-fade-in 1 --bgm-fade-out 2 --master-fade-out 0 --bgm-loop-off`；不能将最后的人声一起淡出。
+  `--bgm-relative-to-voice --bgm-fade-in 1 --bgm-fade-out 2 --master-fade-out 0 --bgm-loop-off`；
+  音量 .10 指按原片实际人声 RMS 校准到 10% 以内，保留校准测量与实际增益；不能凭曲目音量百分比猜测人声是否清晰。
+  不能将最后的人声一起淡出。
   原人声的真实起始偏移与倍速通过音轨提取对齐，混音在输出时间轴上播放一次；原片组件静音，防止人声叠加。
   不能声称已下载或生成未执行的音乐。
 - 服务端音频使用已安装版本支持的 `Html5Audio` / FFmpeg 混音，Studio 可用 `@remotion/media` Audio。

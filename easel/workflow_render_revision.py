@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 
@@ -46,7 +47,7 @@ async def prepare_revision(run, directory: Path):
             "不要编造完成情况，不输出任务分类或工具推演。只修改提及字段，保留其他值。"
             "能力：subtitle_size=36–96（1080基准）；subtitle_bottom=.025–.30（距底部占画面高度）；"
             "playback_rate=.5–2（视频、人声和字幕/分镜同步映射，保持音调）；"
-            "bgm_enabled布尔；bgm_track为auto或下列登记曲目的文件名；bgm_volume=0–.20；bgm_fade_in/out=0–5秒；"
+            "bgm_enabled布尔；bgm_track为auto或下列登记曲目的文件名；bgm_volume=0–.20（相对本片实际人声音量，宿主会校准）；bgm_fade_in/out=0–5秒；"
             "background/accent/text_color六位HEX；card_position=left/right；title_case=normal/bold。"
             "要求字号更大但无具体数值可用64，要求上移但无具体数值可用.12；适合口播的安静音乐默认音量.10、淡入1/淡出2。"
             "bgm_track不要猜本地路径，优先选库中与风格匹配且未标Rejected的安静配乐；没有可选曲目则明确未实现。"
@@ -99,26 +100,38 @@ async def prepare_revision(run, directory: Path):
             "-map", "0:a:0", "-af", f"aresample=48000:async=1:first_pts=0,atempo={preferences['playback_rate']},apad,atrim=duration={output_duration}",
             "-c:a", "pcm_s16le", voice], label="保留原人声时间偏移并按要求调整倍速")
         mixed = directory / "voice-and-music.wav"
-        await run.command([run.python, mixer, "mix", "--voice", voice, "--bgm", path,
+        _, mix_output = await run.command([run.python, mixer, "mix", "--voice", voice, "--bgm", path,
             "--bgm-volume", preferences["bgm_volume"], "--bgm-loop-off", "--duration", output_duration,
+            "--bgm-relative-to-voice",
             "--bgm-fade-in", preferences["bgm_fade_in"], "--bgm-fade-out", preferences["bgm_fade_out"],
             "--master-fade-out", "0", "-o", mixed], label="调用原 audio-mix Skill 工具：人声优先闪避与配乐混音")
         if not mixed.is_file() or mixed.stat().st_size == 0:
             raise RunnerBlocked("原 audio-mix 未交付有效混音文件。")
+        calibration_line = re.search(r"^BGM_CALIBRATION (.+)$", mix_output, flags=re.M)
+        if not calibration_line:
+            raise RunnerBlocked("原 audio-mix 未交付人声配乐音量校准记录，停止使用。")
+        calibration = json.loads(calibration_line[1])
+        gain = calibration.get("effective_bgm_volume")
+        if type(gain) not in (float, int) or not math.isfinite(gain) or not 0 <= gain <= preferences["bgm_volume"]:
+            raise RunnerBlocked("配乐实际音量校准值无效。")
         mixed_hash = await asyncio.to_thread(file_sha256, mixed)
         mixed_name = f"mixed-{mixed_hash[:24]}.wav"
         await asyncio.to_thread(shutil.copy2, mixed, run.work / "public" / mixed_name)
         music.update(mixed_source=mixed_name, mixed_sha256=mixed_hash, mixer_path="skills/shared/scripts/audio_mix.py",
-                     mixer_sha256=file_sha256(mixer), ducking=True, voice_pitch_preserved=True)
-        run.notify({"kind": "tool", "text": f"配乐已准备：{music['title']}，音量 {preferences['bgm_volume']:.0%}，真实时长 {duration:.1f}s；保留原人声。"})
+                     mixer_sha256=file_sha256(mixer), ducking=True, voice_pitch_preserved=True, calibration=calibration)
+        run.notify({"kind": "tool", "text": f"配乐已准备：{music['title']}，按实际人声校准到 {preferences['bgm_volume']:.0%} 以内，开启闪避；保留原人声。"})
     props = revision_props(base, preferences, music)
     props_path = write_json(directory / "render-props.json", props)
     node = next((n for n in run.project.get("nodes", []) if n["id"] == "review"), {})
+    previous = node.get("render_receipt", {})
+    requirements = previous.get("requirements", previous.get("requests", [])) + requests
+    requirements = list({item["id"]: item for item in requirements}.values())
     version = node.get("version", 0) + (1 if run.node == "deliver" else 0)
     receipt = {"run_id": run.options.get("run_id", directory.name), "version": version,
         "props_path": str(props_path), "props_sha256": file_sha256(props_path),
         "base_props_sha256": file_sha256(base_path), "source_sha256": base["source_sha256"],
-        "duration_seconds": props["duration"], "preferences": preferences, "music": music, "requests": requests}
+        "duration_seconds": props["duration"], "preferences": preferences, "music": music,
+        "requests": requests, "requirements": requirements}
     run.notify({"kind": "status", "text": f"实际制作参数已准备：字幕 {preferences['subtitle_size']:g}px，距底部 {preferences['subtitle_bottom']:.0%}，{preferences['playback_rate']:g} 倍速，{'配乐 ' + str(round(preferences['bgm_volume']*100)) + '%，人声优先闪避' if music else '无配乐'}。尚待渲染检查。"})
     return props, props_path, receipt
 
